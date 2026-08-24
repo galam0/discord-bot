@@ -50,12 +50,8 @@ class ValorantAPI:
         
         res = self.session.put('https://auth.riotgames.com/api/v1/authorization', json=login_body, headers=self.headers).json()
         
-        # 2단계 인증이 필요한 경우
-        if res.get('type') == 'multifactor':
-            if not mfa_code:
-                return "2FA_REQUIRED", None
-            
-            # 2FA 코드 제출
+        # 1. 2FA 코드가 제출되었을 경우 처리
+        if mfa_code:
             mfa_body = {
                 "type": "multifactor",
                 "code": mfa_code,
@@ -63,8 +59,13 @@ class ValorantAPI:
             }
             res = self.session.put('https://auth.riotgames.com/api/v1/authorization', json=mfa_body, headers=self.headers).json()
 
-        if 'error' in res:
-            return "ERROR", "❌ 로그인 실패: 아이디/비밀번호 또는 2FA 코드가 올바르지 않습니다."
+        # 2. 2단계 인증 요구 감지 (type이 multifactor이거나 error가 multifactor_attempt인 경우)
+        if res.get('type') == 'multifactor' or res.get('error') == 'multifactor_attempt':
+            return "2FA_REQUIRED", None
+
+        # 3. 로그인 실패 처리
+        if 'error' in res or 'response' not in res:
+            return "ERROR", "❌ 로그인 실패: 아이디/비밀번호가 틀렸거나 2FA 코드가 올바르지 않습니다."
 
         try:
             uri = res['response']['parameters']['uri']
@@ -116,15 +117,17 @@ class TwoFactorModal(discord.ui.Modal, title="2단계 인증(2FA) 코드 입력"
         max_length=6
     )
 
-    def __init__(self, api_instance, username, password):
+    def __init__(self, username, password):
         super().__init__()
-        self.api = api_instance
         self.username = username
         self.password = password
 
     async def on_submit(self, interaction: discord.Interaction):
         await interaction.response.defer(ephemeral=True)
-        status, result = self.api.login(self.username, self.password, self.code.value)
+        
+        # 새 세션으로 2FA 코드 제출
+        api = ValorantAPI()
+        status, result = api.login(self.username, self.password, mfa_code=self.code.value)
         
         if status == "ERROR":
             await interaction.followup.send(content=result, ephemeral=True)
@@ -153,10 +156,10 @@ class ValorantAuthModal(discord.ui.Modal, title="발로란트 로그인"):
         api = ValorantAPI()
         status, result = api.login(self.username.value, self.password.value)
 
-        # 2단계 인증이 필요한 경우 2FA 팝업을 다시 띄움
+        # 2단계 인증 감지 시 팝업 전환
         if status == "2FA_REQUIRED":
             await interaction.response.send_modal(
-                TwoFactorModal(api_instance=api, username=self.username.value, password=self.password.value)
+                TwoFactorModal(username=self.username.value, password=self.password.value)
             )
             return
 
