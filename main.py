@@ -49,8 +49,9 @@ class ValorantAPI:
         }
         
         res = self.session.put('https://auth.riotgames.com/api/v1/authorization', json=login_body, headers=self.headers).json()
-        
-        # 1. 2FA 코드가 제출되었을 경우 처리
+        print(f"[DEBUG] 라이엇 로그인 응답: {res}") # Render 대시보드 로그 확인용
+
+        # 1. 이미 2FA 코드가 함께 전달되었을 때의 처리
         if mfa_code:
             mfa_body = {
                 "type": "multifactor",
@@ -58,14 +59,25 @@ class ValorantAPI:
                 "rememberDevice": True
             }
             res = self.session.put('https://auth.riotgames.com/api/v1/authorization', json=mfa_body, headers=self.headers).json()
+            print(f"[DEBUG] 2FA 제출 응답: {res}")
 
-        # 2. 2단계 인증 요구 감지 (type이 multifactor이거나 error가 multifactor_attempt인 경우)
-        if res.get('type') == 'multifactor' or res.get('error') == 'multifactor_attempt':
+        # 2. 2단계 인증(2FA) 감지 로직 강화
+        is_mfa = False
+        if res.get('type') == 'multifactor':
+            is_mfa = True
+        elif res.get('error') == 'multifactor_attempt':
+            is_mfa = True
+        elif 'response' in res and 'parameters' in res['response']:
+            uri_str = str(res['response']['parameters'])
+            if 'multifactor' in uri_str or 'sub-multifactor' in uri_str:
+                is_mfa = True
+
+        if is_mfa:
             return "2FA_REQUIRED", None
 
-        # 3. 로그인 실패 처리
-        if 'error' in res or 'response' not in res:
-            return "ERROR", "❌ 로그인 실패: 아이디/비밀번호가 틀렸거나 2FA 코드가 올바르지 않습니다."
+        # 3. 일반 로그인 실패 처리
+        if 'error' in res or 'response' not in res or 'parameters' not in res.get('response', {}):
+            return "ERROR", "❌ 로그인 실패: 아이디/비밀번호가 틀렸거나 2FA 인증에 실패했습니다."
 
         try:
             uri = res['response']['parameters']['uri']
@@ -125,7 +137,6 @@ class TwoFactorModal(discord.ui.Modal, title="2단계 인증(2FA) 코드 입력"
     async def on_submit(self, interaction: discord.Interaction):
         await interaction.response.defer(ephemeral=True)
         
-        # 새 세션으로 2FA 코드 제출
         api = ValorantAPI()
         status, result = api.login(self.username, self.password, mfa_code=self.code.value)
         
@@ -156,7 +167,7 @@ class ValorantAuthModal(discord.ui.Modal, title="발로란트 로그인"):
         api = ValorantAPI()
         status, result = api.login(self.username.value, self.password.value)
 
-        # 2단계 인증 감지 시 팝업 전환
+        # 2단계 인증 요구 감지 시 2차 입력 모달 팝업 표시
         if status == "2FA_REQUIRED":
             await interaction.response.send_modal(
                 TwoFactorModal(username=self.username.value, password=self.password.value)
