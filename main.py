@@ -46,30 +46,60 @@ TYPE_KO = {
 }
 
 # ==========================================
-# 3. 포켓몬 정보 조회 및 Embed 생성 함수
+# 3. 입력값(한국어/영어/숫자) -> 도감 번호 변환 함수
+# ==========================================
+def resolve_pokemon_id(query):
+    query = query.strip().lower()
+    
+    # 1) 숫자인 경우 그대로 반환
+    if query.isdigit():
+        return query
+
+    # 2) 영어/기본 이름으로 직접 접근 시도
+    species_url = f'https://pokeapi.co/api/v2/pokemon-species/{query}'
+    res = requests.get(species_url)
+    if res.status_code == 200:
+        return str(res.json()['id'])
+
+    # 3) 한국어 이름 검색 (전체 목록 탐색)
+    list_url = 'https://pokeapi.co/api/v2/pokemon-species?limit=1025'
+    list_res = requests.get(list_url)
+    if list_res.status_code == 200:
+        results = list_res.json()['results']
+        for item in results:
+            spec_res = requests.get(item['url'])
+            if spec_res.status_code == 200:
+                spec_data = spec_res.json()
+                for name_entry in spec_data['names']:
+                    if name_entry['language']['name'] == 'ko' and name_entry['name'].lower() == query:
+                        return str(spec_data['id'])
+    return None
+
+# ==========================================
+# 4. 포켓몬 정보 조회 및 Embed 생성 함수
 # ==========================================
 def get_pokemon_embed(pokemon_id_or_name):
-    species_name = str(pokemon_id_or_name).split('-')[0]
-    species_url = f'https://pokeapi.co/api/v2/pokemon-species/{species_name}'
-    species_res = requests.get(species_url)
+    pokemon_id = resolve_pokemon_id(str(pokemon_id_or_name))
+    if not pokemon_id:
+        return None, None
 
+    species_url = f'https://pokeapi.co/api/v2/pokemon-species/{pokemon_id}'
+    species_res = requests.get(species_url)
     if species_res.status_code != 200:
         return None, None
 
     species_data = species_res.json()
-    species_id = species_data['id']
 
-    # 한국어 이름 추출
-    display_name = str(species_id)
+    # 한국어 공식 이름 추출
+    display_name = str(pokemon_id)
     for name_entry in species_data['names']:
         if name_entry['language']['name'] == 'ko':
             display_name = name_entry['name']
             break
 
     # 상세 정보 가져오기 (타입, 이미지 등)
-    detail_url = f'https://pokeapi.co/api/v2/pokemon/{pokemon_id_or_name}'
+    detail_url = f'https://pokeapi.co/api/v2/pokemon/{pokemon_id}'
     detail_res = requests.get(detail_url)
-    
     if detail_res.status_code != 200:
         return None, None
         
@@ -78,17 +108,15 @@ def get_pokemon_embed(pokemon_id_or_name):
     weight = data['weight'] / 10
     image_url = data['sprites']['other']['official-artwork']['front_default'] or data['sprites']['front_default']
 
-    # 메가진화 표기 처리
     if 'mega' in str(pokemon_id_or_name).lower():
         display_name = f"메가 {display_name}"
 
-    # 타입 한국어 변환
     types_list = [TYPE_KO.get(t['type']['name'], t['type']['name'].capitalize()) for t in data['types']]
     types_str = ", ".join(types_list)
 
     embed = discord.Embed(title=f"포켓몬 정보: {display_name}", color=0xcc0000)
     embed.set_thumbnail(url=image_url)
-    embed.add_field(name="도감 번호", value=f"No.{species_id}", inline=False)
+    embed.add_field(name="도감 번호", value=f"No.{pokemon_id}", inline=False)
     embed.add_field(name="타입", value=types_str, inline=False)
     embed.add_field(name="키", value=f"{height}m", inline=True)
     embed.add_field(name="몸무게", value=f"{weight}kg", inline=True)
@@ -96,7 +124,7 @@ def get_pokemon_embed(pokemon_id_or_name):
     return embed, species_data
 
 # ==========================================
-# 4. 진화 / 메가진화 버튼 View 클래스
+# 5. 진화 / 메가진화 버튼 View 클래스
 # ==========================================
 class PokemonEvolutionView(discord.ui.View):
     def __init__(self, species_data, current_pokemon_name):
@@ -106,7 +134,6 @@ class PokemonEvolutionView(discord.ui.View):
         self.setup_buttons()
 
     def setup_buttons(self):
-        # 1. 진화 단계 탐색
         evo_chain_url = self.species_data['evolution_chain']['url']
         chain_res = requests.get(evo_chain_url)
         
@@ -124,7 +151,6 @@ class PokemonEvolutionView(discord.ui.View):
                 btn.callback = self.on_evolution_click
                 self.add_item(btn)
 
-        # 2. 메가진화 탐색
         varieties = self.species_data.get('varieties', [])
         for var in varieties:
             var_name = var['pokemon']['name']
@@ -163,7 +189,7 @@ class PokemonEvolutionView(discord.ui.View):
             await interaction.response.send_message("진화 정보를 불러올 수 없습니다.", ephemeral=True)
 
 # ==========================================
-# 5. 디스코드 이벤트 핸들러 및 명령어
+# 6. 디스코드 이벤트 핸들러 및 명령어
 # ==========================================
 @client.event
 async def on_ready():
@@ -174,18 +200,18 @@ async def on_message(message):
     if message.author == client.user:
         return
 
-    # 1. 도감 사용법 안내
+    # 1. 도감 사용법
     if message.content == '!도감':
         embed = discord.Embed(
             title="📖 포켓몬 도감 사용법",
-            description="`!도감 [포켓몬 이름 또는 번호]` 형식으로 입력해 주세요!\n\n**예시:**\n• `!도감 피카츄` (한국어 검색)\n• `!도감 6` (리자몽 - 메가진화/진화 테스트)",
+            description="`!도감 [포켓몬 이름 또는 번호]` 형식으로 입력해 주세요!\n\n**예시:**\n• `!도감 리자몽` (한국어 검색)\n• `!도감 6` (도감 번호 검색)",
             color=0x3498db
         )
         await message.channel.send(embed=embed)
 
-    # 2. 도감 상세 검색 (한국어, 타입, 진화/메가진화 버튼)
+    # 2. 도감 상세 검색
     elif message.content.startswith('!도감 '):
-        query = message.content.split(' ')[1].strip().lower()
+        query = message.content.split(' ')[1].strip()
         embed, species_data = get_pokemon_embed(query)
 
         if embed and species_data:
@@ -194,17 +220,17 @@ async def on_message(message):
         else:
             await message.channel.send('포켓몬을 찾을 수 없어요. 이름을 정확히 입력해 주세요!')
 
-    # 3. 포획 기능 (PokeAPI 검증 + 공식 한국어 이름 자동 변환 저장)
+    # 3. 포획 기능
     elif message.content.startswith('!포획 '):
-        query = message.content.split(' ')[1].strip().lower()
-        
-        species_url = f'https://pokeapi.co/api/v2/pokemon-species/{query}'
-        species_res = requests.get(species_url)
+        query = message.content.split(' ')[1].strip()
+        pokemon_id = resolve_pokemon_id(query)
 
-        if species_res.status_code == 200:
+        if pokemon_id:
+            species_url = f'https://pokeapi.co/api/v2/pokemon-species/{pokemon_id}'
+            species_res = requests.get(species_url)
             species_data = species_res.json()
-            pokemon_name = str(species_data['id'])
-
+            
+            pokemon_name = pokemon_id
             for name_entry in species_data['names']:
                 if name_entry['language']['name'] == 'ko':
                     pokemon_name = name_entry['name']
@@ -225,7 +251,7 @@ async def on_message(message):
         else:
             await message.channel.send("존재하지 않는 포켓몬입니다. 포켓몬 이름이나 번호를 정확히 입력해 주세요!")
 
-    # 4. 내 포켓몬 목록 조회
+    # 4. 내 포켓몬 목록
     elif message.content == '!내포켓몬':
         user_id = str(message.author.id)
         user_data = collection.find_one({"_id": user_id})
@@ -234,9 +260,9 @@ async def on_message(message):
             pokemon_list = ", ".join(user_data["pokemon_list"])
             await message.channel.send(f"📖 **{message.author.display_name}님의 포켓몬 도감**\n{pokemon_list}")
         else:
-            await message.channel.send("아직 잡은 포켓몬이 없습니다. `!포획 포켓몬이름`으로 먼저 포켓몬을 잡아보세요!")
+            await message.channel.send("아직 잡은 포켓몬이 없습니다.")
 
-    # 5. 포획 수 순위 표기 (Top 5)
+    # 5. 순위 표기
     elif message.content == '!순위':
         all_users = collection.find()
         ranking = []
@@ -260,6 +286,5 @@ async def on_message(message):
             
         await message.channel.send(embed=embed)
 
-# 서버 및 봇 가동
 keep_alive()
 client.run(os.environ.get('DISCORD_TOKEN'))
