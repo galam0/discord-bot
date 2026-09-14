@@ -54,85 +54,145 @@ TYPE_KO = {
 # 3. 픽셀몬 위키 스폰 전용 테이블 정밀 추출 함수
 # ==========================================
 async def get_pixelmon_spawn_info(english_name):
+    """
+    Pixelmon Wiki의 'Spawn Biomes' 표에서만 출몰 시간과 바이옴을 가져옵니다.
+    페이지 전체의 다른 표(Moves, Held item 등)는 절대 스캔하지 않습니다.
+    """
     formatted_name = english_name.capitalize()
     wiki_url = f"https://pixelmonmod.com/wiki/{formatted_name}"
-    
+
     headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/120.0.0.0 Safari/537.36"
+        )
     }
 
-    valid_biome_keywords = [
-        'forest', 'plains', 'taiga', 'desert', 'jungle', 'swamp', 'beach', 
-        'mountain', 'hills', 'mesa', 'badlands', 'savanna', 'river', 'ocean', 
-        'deep', 'snowy', 'frozen', 'ice', 'mushroom', 'flower', 'roofed', 
-        'birch', 'dark', 'windswept', 'stony', 'dripstone', 'lush', 'grove', 
-        'meadow', 'jagged', 'cherry', 'mangrove', 'nether', 'end', 'hell', 'peak'
+    # Pixelmon의 실제 Spawn Time 종류
+    time_order = [
+        "Dawn", "Morning", "Day", "Midday",
+        "Afternoon", "Dusk", "Night", "Midnight", "Any"
     ]
 
     try:
         async with aiohttp.ClientSession() as session:
-            async with session.get(wiki_url, headers=headers, timeout=4) as response:
-                if response.status == 200:
-                    html = await response.text()
-                    soup = BeautifulSoup(html, 'html.parser')
-                    
-                    biomes = set()
-                    times = set()
+            async with session.get(
+                wiki_url,
+                headers=headers,
+                timeout=10
+            ) as response:
 
-                    # 위키 페이지 내의 모든 헤더(h2, h3, h4)를 순회하며 'Spawn' 관련 섹션 찾기
-                    spawn_section_found = False
-                    for element in soup.find_all(['h2', 'h3', 'h4', 'table', 'div']):
-                        # 헤더 제목이 스폰 관련인지 확인
-                        if element.name in ['h2', 'h3', 'h4']:
-                            header_text = element.get_text().lower()
-                            if 'spawn' in header_text:
-                                spawn_section_found = True
-                            else:
-                                # 다른 섹션(Moves 등)을 만나면 스폰 섹션 해제
-                                if spawn_section_found and ('move' in header_text or 'drop' in header_text or 'evolution' in header_text):
-                                    spawn_section_found = False
+                if response.status != 200:
+                    print(f"❌ 위키 접속 실패: {english_name} / HTTP {response.status}")
+                    return "정보 없음", "Any"
 
-                        # 테이블이고, 스폰 섹션 안이거나 클래스에 spawn이 포함된 경우에만 집중 파싱
-                        if element.name == 'table':
-                            table_html = str(element).lower()
-                            is_spawn_table = spawn_section_found or 'spawn' in table_html or 'biome' in table_html
-                            
-                            # 만약 기술(Moves) 관련 표라면 무조건 건너뜀
-                            if 'move' in table_html or 'tm/hm' in table_html or 'level up' in table_html:
-                                continue
+                html = await response.text()
+                soup = BeautifulSoup(html, "html.parser")
 
-                            if is_spawn_table:
-                                for td in element.find_all('td'):
-                                    text = td.get_text().strip()
-                                    
-                                    # 시간 추출
-                                    for t in ['Day', 'Night', 'Dawn', 'Dusk', 'Any']:
-                                        if t.lower() in text.lower():
-                                            times.add(t)
+                # ==========================================
+                # 1. 'Spawn Biomes' 섹션 제목을 정확히 찾기
+                # ==========================================
+                spawn_heading = None
 
-                                    # 바이옴 추출
-                                    parts = re.split(r'[,/\n]+', text)
-                                    for p in parts:
-                                        p_clean = p.strip()
-                                        p_lower = p_clean.lower()
-                                        
-                                        if 3 <= len(p_clean) <= 25:
-                                            # 유효한 마크 바이옴 키워드가 포함되어 있고, 기술이나 불필요 단어가 아닌 경우만 인정
-                                            if any(vk in p_lower for vk in valid_biome_keywords):
-                                                if not any(bad in p_lower for bad in ['voice', 'endure', 'ratio', 'gender', 'level', 'wild', 'tm', 'tutor', 'egg', 'afternoon', 'morning']):
-                                                    biomes.add(p_clean)
+                for heading in soup.find_all(["h2", "h3", "h4"]):
+                    heading_text = heading.get_text(" ", strip=True).lower()
 
-                    final_biome = ", ".join(sorted(list(biomes))) if biomes else "Ocean, Beach"
-                    final_time = ", ".join(sorted(list(times))) if times else "Any"
+                    if "spawn biomes" in heading_text:
+                        spawn_heading = heading
+                        break
 
-                    if len(final_biome) > 60:
-                        final_biome = final_biome[:57] + "..."
+                if spawn_heading is None:
+                    print(f"⚠️ Spawn Biomes 섹션을 찾지 못함: {english_name}")
+                    return "정보 없음", "Any"
 
-                    return final_biome, final_time
-    except Exception:
-        pass
+                # ==========================================
+                # 2. Spawn Biomes 제목 바로 아래의 표만 사용
+                # ==========================================
+                spawn_table = spawn_heading.find_next("table")
 
-    return "Ocean, Beach", "Any"
+                if spawn_table is None:
+                    print(f"⚠️ Spawn Biomes 표를 찾지 못함: {english_name}")
+                    return "정보 없음", "Any"
+
+                biomes = set()
+                times = set()
+
+                # ==========================================
+                # 3. 표의 행을 분석
+                #
+                # 공식 표 구조:
+                # Biome | ModID | Time | Location | Condition | Rarity
+                # ==========================================
+                for row in spawn_table.find_all("tr"):
+                    cells = row.find_all(["th", "td"])
+
+                    if len(cells) < 3:
+                        continue
+
+                    values = [
+                        cell.get_text(" ", strip=True)
+                        for cell in cells
+                    ]
+
+                    # 헤더 행 무시
+                    if values[0].strip().lower() == "biome":
+                        continue
+
+                    biome = values[0].strip()
+                    spawn_time = values[2].strip()
+
+                    # 바이옴 저장
+                    if biome:
+                        biomes.add(biome)
+
+                    # 출몰 시간 저장
+                    if spawn_time:
+                        # 여러 시간이 한 셀에 들어오는 경우도 대비
+                        for time_name in time_order:
+                            if re.search(
+                                rf"\b{re.escape(time_name)}\b",
+                                spawn_time,
+                                re.IGNORECASE
+                            ):
+                                times.add(time_name)
+
+                # ==========================================
+                # 4. 표시 순서 정리
+                # ==========================================
+                sorted_times = [
+                    time_name
+                    for time_name in time_order
+                    if time_name in times
+                ]
+
+                # 바이옴은 알파벳순으로 정렬
+                sorted_biomes = sorted(biomes, key=str.lower)
+
+                time_text = ", ".join(sorted_times) if sorted_times else "Any"
+                biome_text = ", ".join(sorted_biomes) if sorted_biomes else "정보 없음"
+
+                # ==========================================
+                # 5. Discord Embed field 길이 보호
+                # ==========================================
+                if len(time_text) > 1000:
+                    time_text = time_text[:997] + "..."
+
+                if len(biome_text) > 1000:
+                    biome_text = biome_text[:997] + "..."
+
+                print(
+                    f"✅ {english_name}: "
+                    f"시간=[{time_text}] / 바이옴=[{biome_text}]"
+                )
+
+                return biome_text, time_text
+
+    except Exception as e:
+        print(f"❌ Pixelmon 스폰 정보 오류: {english_name} / {e}")
+
+    return "정보 없음", "Any"
+
 # ==========================================
 # 4. 한국어 사전 구축 (aiohttp)
 # ==========================================
