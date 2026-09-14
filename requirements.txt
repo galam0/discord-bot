@@ -1,5 +1,4 @@
-discord.py[voice]
-PyNaCl
-Flask
-gunicorn
+discord.py
 requests
+pymongo
+Flask
