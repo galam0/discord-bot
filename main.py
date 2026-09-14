@@ -51,7 +51,7 @@ TYPE_KO = {
 }
 
 # ==========================================
-# 3. 픽셀몬 위키 마인크래프트 바이옴 정밀 추출 함수
+# 3. 픽셀몬 위키 스폰 전용 테이블 정밀 추출 함수
 # ==========================================
 async def get_pixelmon_spawn_info(english_name):
     formatted_name = english_name.capitalize()
@@ -61,13 +61,12 @@ async def get_pixelmon_spawn_info(english_name):
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
     }
 
-    # 마인크래프트/픽셀몬에서 실제 바이옴으로 인정되는 단어들
     valid_biome_keywords = [
         'forest', 'plains', 'taiga', 'desert', 'jungle', 'swamp', 'beach', 
         'mountain', 'hills', 'mesa', 'badlands', 'savanna', 'river', 'ocean', 
         'deep', 'snowy', 'frozen', 'ice', 'mushroom', 'flower', 'roofed', 
         'birch', 'dark', 'windswept', 'stony', 'dripstone', 'lush', 'grove', 
-        'meadow', 'jagged', 'stony', 'cherry', 'mangrove', 'nether', 'end', 'hell'
+        'meadow', 'jagged', 'cherry', 'mangrove', 'nether', 'end', 'hell', 'peak'
     ]
 
     try:
@@ -80,29 +79,51 @@ async def get_pixelmon_spawn_info(english_name):
                     biomes = set()
                     times = set()
 
-                    # 위키 테이블 셀(td)을 순회하며 실제 마인크래프트 바이옴 이름이 포함된 텍스트만 추출
-                    for td in soup.find_all('td'):
-                        text = td.get_text().strip()
-                        # 시간 관련 키워드 추출
-                        for t in ['Day', 'Night', 'Dawn', 'Dusk', 'Any']:
-                            if t.lower() in text.lower():
-                                times.add(t)
+                    # 위키 페이지 내의 모든 헤더(h2, h3, h4)를 순회하며 'Spawn' 관련 섹션 찾기
+                    spawn_section_found = False
+                    for element in soup.find_all(['h2', 'h3', 'h4', 'table', 'div']):
+                        # 헤더 제목이 스폰 관련인지 확인
+                        if element.name in ['h2', 'h3', 'h4']:
+                            header_text = element.get_text().lower()
+                            if 'spawn' in header_text:
+                                spawn_section_found = True
+                            else:
+                                # 다른 섹션(Moves 등)을 만나면 스폰 섹션 해제
+                                if spawn_section_found and ('move' in header_text or 'drop' in header_text or 'evolution' in header_text):
+                                    spawn_section_found = False
 
-                        # 쉼표나 슬래시로 쪼개서 개별 단어/구문 확인
-                        parts = re.split(r'[,/\n]+', text)
-                        for p in parts:
-                            p_clean = p.strip()
-                            p_lower = p_clean.lower()
+                        # 테이블이고, 스폰 섹션 안이거나 클래스에 spawn이 포함된 경우에만 집중 파싱
+                        if element.name == 'table':
+                            table_html = str(element).lower()
+                            is_spawn_table = spawn_section_found or 'spawn' in table_html or 'biome' in table_html
                             
-                            # 글자 수가 너무 짧거나 길지 않고, 유효한 바이옴 키워드가 포함된 경우만 허용
-                            if 3 <= len(p_clean) <= 30:
-                                if any(vk in p_lower for vk in valid_biome_keywords):
-                                    # 잘못 섞이는 시간/확률 관련 단어가 포함되어 있으면 제외
-                                    if not any(bad in p_lower for bad in ['afternoon', 'morning', 'spawn', 'rate', 'level', 'wild', 'bop', 'byg']):
-                                        biomes.add(p_clean)
+                            # 만약 기술(Moves) 관련 표라면 무조건 건너뜀
+                            if 'move' in table_html or 'tm/hm' in table_html or 'level up' in table_html:
+                                continue
 
-                    final_biome = ", ".join(sorted(list(biomes))) if biomes else "Forest, Plains"
-                    final_time = ", ".join(sorted(list(times))) if times else "Night"
+                            if is_spawn_table:
+                                for td in element.find_all('td'):
+                                    text = td.get_text().strip()
+                                    
+                                    # 시간 추출
+                                    for t in ['Day', 'Night', 'Dawn', 'Dusk', 'Any']:
+                                        if t.lower() in text.lower():
+                                            times.add(t)
+
+                                    # 바이옴 추출
+                                    parts = re.split(r'[,/\n]+', text)
+                                    for p in parts:
+                                        p_clean = p.strip()
+                                        p_lower = p_clean.lower()
+                                        
+                                        if 3 <= len(p_clean) <= 25:
+                                            # 유효한 마크 바이옴 키워드가 포함되어 있고, 기술이나 불필요 단어가 아닌 경우만 인정
+                                            if any(vk in p_lower for vk in valid_biome_keywords):
+                                                if not any(bad in p_lower for bad in ['voice', 'endure', 'ratio', 'gender', 'level', 'wild', 'tm', 'tutor', 'egg', 'afternoon', 'morning']):
+                                                    biomes.add(p_clean)
+
+                    final_biome = ", ".join(sorted(list(biomes))) if biomes else "Ocean, Beach"
+                    final_time = ", ".join(sorted(list(times))) if times else "Any"
 
                     if len(final_biome) > 60:
                         final_biome = final_biome[:57] + "..."
@@ -111,7 +132,7 @@ async def get_pixelmon_spawn_info(english_name):
     except Exception:
         pass
 
-    return "Forest, Plains", "Night"
+    return "Ocean, Beach", "Any"
 # ==========================================
 # 4. 한국어 사전 구축 (aiohttp)
 # ==========================================
