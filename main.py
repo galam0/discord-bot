@@ -35,8 +35,8 @@ mongo_client = MongoClient(mongo_uri)
 db = mongo_client['pokemon_game']
 collection = db['users']
 
-# 한국어 ↔ 도감 번호 매핑 캐시 사전
-KOREAN_NAME_TO_ID = {}
+# 전 포켓몬 한국어 이름 ↔ ID 캐시 사전
+POKEMON_KO_TO_ID = {}
 
 TYPE_KO = {
     'normal': '⚪ 노말', 'fire': '🔥 불꽃', 'water': '💧 물',
@@ -48,7 +48,7 @@ TYPE_KO = {
 }
 
 # ==========================================
-# 3. 검색어(한국어/영어/숫자) -> 도감 ID 변환
+# 3. 입력값(한국어/영어/숫자) -> 도감 ID 변환
 # ==========================================
 def resolve_pokemon_id(query):
     query = query.strip().lower()
@@ -58,8 +58,8 @@ def resolve_pokemon_id(query):
         return query
 
     # 2) 한국어 사전에 있는 경우
-    if query in KOREAN_NAME_TO_ID:
-        return KOREAN_NAME_TO_ID[query]
+    if query in POKEMON_KO_TO_ID:
+        return str(POKEMON_KO_TO_ID[query])
 
     # 3) 영어 이름인 경우 직접 호출 시도
     species_url = f'https://pokeapi.co/api/v2/pokemon-species/{query}'
@@ -184,26 +184,32 @@ class PokemonEvolutionView(discord.ui.View):
             await interaction.followup.send("진화 정보를 불러올 수 없습니다.", ephemeral=True)
 
 # ==========================================
-# 6. 디스코드 이벤트 핸들러 및 명령어
+# 6. 디스코드 이벤트 핸들러 및 사전 자동 구축
 # ==========================================
 @client.event
 async def on_ready():
-    print('한국어 도감 데이터를 미리 불러오는 중입니다... 잠시만 기다려주세요.')
-    # 봇 시작 시 전체 포켓몬 한국어 이름을 캐싱합니다.
+    print('🔄 모든 포켓몬의 한국어 도감 데이터를 수집 중입니다. 잠시만 기다려주세요...')
+    
+    # PokeAPI에서 제공하는 1000여 개 포켓몬의 한국어 이름을 부팅 시 사전으로 수집
     try:
         res = requests.get('https://pokeapi.co/api/v2/pokemon-species?limit=1025')
         if res.status_code == 200:
             results = res.json()['results']
             for item in results:
-                # ID 추출
-                pokemon_id = item['url'].split('/')[-2]
-                # 통신량을 줄이기 위해 일단 1~300번 주요 포켓몬 및 기본 매핑 구조 준비
-                # 실시간 조회 시 사전 자동 보완
-                KOREAN_NAME_TO_ID[item['name']] = pokemon_id
+                p_id = item['url'].split('/')[-2]
+                # 각 포켓몬의 species 정보에서 한국어 이름 추출
+                detail_res = requests.get(item['url'])
+                if detail_res.status_code == 200:
+                    names = detail_res.json().get('names', [])
+                    for n in names:
+                        if n['language']['name'] == 'ko':
+                            POKEMON_KO_TO_ID[n['name'].lower()] = p_id
+                            break
+        print(f"✅ 총 {len(POKEMON_KO_TO_ID)}마리 포켓몬의 한국어 이름 등록이 완료되었습니다!")
     except Exception as e:
-        print(f"캐싱 중 오류 발생: {e}")
-        
-    print('포켓몬 봇이 성공적으로 실행되었습니다!')
+        print(f"⚠️ 캐싱 중 오류 발생: {e}")
+
+    print('🚀 포켓몬 봇이 완벽하게 가동되었습니다!')
 
 @client.event
 async def on_message(message):
@@ -214,7 +220,7 @@ async def on_message(message):
     if message.content == '!도감':
         embed = discord.Embed(
             title="📖 포켓몬 도감 사용법",
-            description="`!도감 [포켓몬 이름 또는 번호]` 형식으로 입력해 주세요!\n\n**예시:**\n• `!도감 페로코체` / `!도감 리자몽` (한국어 검색)\n• `!도감 795` (도감 번호 검색)",
+            description="`!도감 [포켓몬 이름 또는 번호]` 형식으로 입력해 주세요!\n\n**예시:**\n• `!도감 피카츄` / `!도감 페로코체` / `!도감 나오하` (전 세대 한국어 검색)\n• `!도감 6` (도감 번호 검색)",
             color=0x3498db
         )
         await message.channel.send(embed=embed)
@@ -224,20 +230,11 @@ async def on_message(message):
         query = message.content.split(' ')[1].strip()
         embed, species_data = get_pokemon_embed(query)
 
-        # 사전 조회가 안 되었을 경우 실시간으로 한국어 단어 직접 검색 파싱 시도
-        if not embed:
-            # 주소에 404가 나더라도 숫자로 직접 포켓몬을 찾을 수 있게 보완
-            species_url = f'https://pokeapi.co/api/v2/pokemon-species/{query.lower()}'
-            res = requests.get(species_url)
-            if res.status_code == 200:
-                embed, species_data = get_pokemon_embed(res.json()['id'])
-
         if embed and species_data:
             view = PokemonEvolutionView(species_data, species_data['name'])
             await message.channel.send(embed=embed, view=view)
         else:
-            # 도감 번호 검색 팁 안내
-            await message.channel.send('포켓몬을 찾을 수 없어요. 한국어 이름이나 도감 번호(예: !도감 795)로 검색해 보세요!')
+            await message.channel.send('포켓몬을 찾을 수 없어요. 포켓몬 이름이나 번호를 정확히 입력해 주세요!')
 
     # 3. 포획 기능
     elif message.content.startswith('!포획 '):
