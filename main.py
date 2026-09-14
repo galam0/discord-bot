@@ -51,7 +51,7 @@ TYPE_KO = {
 }
 
 # ==========================================
-# 3. 픽셀몬 위키 스크래핑 정밀화 및 텍스트 정제 함수
+# 3. 픽셀몬 위키 스크래핑 정밀화 및 텍스트 정제 함수 (완전 업그레이드)
 # ==========================================
 async def get_pixelmon_spawn_info(english_name):
     formatted_name = english_name.capitalize()
@@ -71,11 +71,13 @@ async def get_pixelmon_spawn_info(english_name):
                     biomes = set()
                     times = set()
 
-                    filter_words = {
+                    # 걸러내야 할 불필요한 조건 문구 및 키워드 목록
+                    ignore_phrases = [
                         'biome', 'biomes', 'modid', 'time', 'times', 'location', 
                         'condition', 'rarity', 'spawn time', 'level range in wild', 
-                        'level', 'range', 'in', 'wild', ''
-                    }
+                        'level', 'range', 'in', 'wild', 'spawn rate', 'rate', 'rain',
+                        'thunder', '2x', '1.5x', 'any', 'none', 'and', 'or'
+                    ]
 
                     tables = soup.find_all('table')
                     for table in tables:
@@ -84,14 +86,21 @@ async def get_pixelmon_spawn_info(english_name):
                             text_nodes = [td.get_text().strip() for td in row.find_all(['td', 'th'])]
                             header_line = " ".join(text_nodes).lower()
 
+                            # 바이옴 데이터 수집
                             if 'biome' in header_line:
                                 for td in row.find_all('td'):
                                     val = td.get_text().strip()
-                                    if val and val.lower() not in filter_words and not val.replace(' ', '').isdigit():
-                                        clean_val = re.sub(r'\s+', ' ', val)
-                                        if clean_val.lower() not in filter_words:
-                                            biomes.add(clean_val)
+                                    # 쉼표나 줄바꿈 기준으로 쪼개서 개별 단어 단위로 검사
+                                    parts = re.split(r'[,/\n]+', val)
+                                    for p in parts:
+                                        p_clean = p.strip()
+                                        p_lower = p_clean.lower()
+                                        # 숫자들이거나 무의미한 조건 문구면 제외
+                                        if p_clean and p_lower not in ignore_phrases and not p_clean.isdigit():
+                                            if not any(ip in p_lower for ip in ['spawn', 'rate', 'level', 'condition', 'bop', 'byg']):
+                                                biomes.add(p_clean)
 
+                            # 출몰 시간 데이터 수집
                             if 'time' in header_line:
                                 for td in row.find_all('td'):
                                     val = td.get_text().strip()
@@ -99,21 +108,18 @@ async def get_pixelmon_spawn_info(english_name):
                                         if t.lower() in val.lower():
                                             times.add(t)
 
-                    final_biome = ", ".join(sorted(list(biomes))) if biomes else "Plains, Forest (기본)"
-                    final_time = ", ".join(sorted(list(times))) if times else "Day (낮)"
+                    final_biome = ", ".join(sorted(list(biomes))) if biomes else "Plains, Forest"
+                    final_time = ", ".join(sorted(list(times))) if times else "Day"
 
-                    clean_biomes = [b for b in final_biome.split(', ') if b.lower() not in filter_words]
-                    final_biome = ", ".join(clean_biomes) if clean_biomes else "Plains, Forest (기본)"
-
-                    if len(final_biome) > 60:
-                        final_biome = final_biome[:57] + "..."
+                    # 너무 길 경우 말줄임표 처리
+                    if len(final_biome) > 55:
+                        final_biome = final_biome[:52] + "..."
 
                     return final_biome, final_time
     except Exception:
         pass
 
-    return "Mountain, Hills (기본)", "Day (낮)"
-
+    return "Plains, Forest", "Day"
 # ==========================================
 # 4. 한국어 사전 구축 (aiohttp)
 # ==========================================
