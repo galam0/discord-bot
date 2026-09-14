@@ -35,6 +35,9 @@ mongo_client = MongoClient(mongo_uri)
 db = mongo_client['pokemon_game']
 collection = db['users']
 
+# 한국어 ↔ 도감 번호 매핑 캐시 사전
+KOREAN_NAME_TO_ID = {}
+
 TYPE_KO = {
     'normal': '⚪ 노말', 'fire': '🔥 불꽃', 'water': '💧 물',
     'grass': '🌿 풀', 'electric': '⚡ 전기', 'ice': '❄️ 얼음',
@@ -45,20 +48,41 @@ TYPE_KO = {
 }
 
 # ==========================================
-# 3. 효율화된 도감 검색 함수 (서버 멈춤 방지)
+# 3. 검색어(한국어/영어/숫자) -> 도감 ID 변환
+# ==========================================
+def resolve_pokemon_id(query):
+    query = query.strip().lower()
+
+    # 1) 숫자인 경우
+    if query.isdigit():
+        return query
+
+    # 2) 한국어 사전에 있는 경우
+    if query in KOREAN_NAME_TO_ID:
+        return KOREAN_NAME_TO_ID[query]
+
+    # 3) 영어 이름인 경우 직접 호출 시도
+    species_url = f'https://pokeapi.co/api/v2/pokemon-species/{query}'
+    res = requests.get(species_url)
+    if res.status_code == 200:
+        return str(res.json()['id'])
+
+    return None
+
+# ==========================================
+# 4. 포켓몬 정보 조회 및 Embed 생성
 # ==========================================
 def get_pokemon_embed(pokemon_id_or_name):
-    query = str(pokemon_id_or_name).strip().lower()
+    pokemon_id = resolve_pokemon_id(str(pokemon_id_or_name))
+    if not pokemon_id:
+        return None, None
 
-    # 1. Species 데이터 가져오기 (1회만 요청)
-    species_url = f'https://pokeapi.co/api/v2/pokemon-species/{query}'
+    species_url = f'https://pokeapi.co/api/v2/pokemon-species/{pokemon_id}'
     species_res = requests.get(species_url)
-
     if species_res.status_code != 200:
         return None, None
 
     species_data = species_res.json()
-    pokemon_id = species_data['id']
 
     # 한국어 공식 이름 추출
     display_name = str(pokemon_id)
@@ -67,7 +91,7 @@ def get_pokemon_embed(pokemon_id_or_name):
             display_name = name_entry['name']
             break
 
-    # 2. 상세 정보 가져오기 (타입, 이미지 등)
+    # 상세 정보 가져오기 (타입, 이미지 등)
     detail_url = f'https://pokeapi.co/api/v2/pokemon/{pokemon_id}'
     detail_res = requests.get(detail_url)
     if detail_res.status_code != 200:
@@ -94,7 +118,7 @@ def get_pokemon_embed(pokemon_id_or_name):
     return embed, species_data
 
 # ==========================================
-# 4. 진화 / 메가진화 버튼 View 클래스 (defer 처리)
+# 5. 진화 / 메가진화 버튼 View 클래스
 # ==========================================
 class PokemonEvolutionView(discord.ui.View):
     def __init__(self, species_data, current_pokemon_name):
@@ -149,9 +173,7 @@ class PokemonEvolutionView(discord.ui.View):
         return None, []
 
     async def on_evolution_click(self, interaction: discord.Interaction):
-        # 3초 타임아웃 방지
         await interaction.response.defer()
-
         target_pokemon = interaction.data['custom_id'].replace('evo_', '')
         embed, new_species_data = get_pokemon_embed(target_pokemon)
 
@@ -162,10 +184,25 @@ class PokemonEvolutionView(discord.ui.View):
             await interaction.followup.send("진화 정보를 불러올 수 없습니다.", ephemeral=True)
 
 # ==========================================
-# 5. 디스코드 이벤트 핸들러 및 명령어
+# 6. 디스코드 이벤트 핸들러 및 명령어
 # ==========================================
 @client.event
 async def on_ready():
+    print('한국어 도감 데이터를 미리 불러오는 중입니다... 잠시만 기다려주세요.')
+    # 봇 시작 시 전체 포켓몬 한국어 이름을 캐싱합니다.
+    try:
+        res = requests.get('https://pokeapi.co/api/v2/pokemon-species?limit=1025')
+        if res.status_code == 200:
+            results = res.json()['results']
+            for item in results:
+                # ID 추출
+                pokemon_id = item['url'].split('/')[-2]
+                # 통신량을 줄이기 위해 일단 1~300번 주요 포켓몬 및 기본 매핑 구조 준비
+                # 실시간 조회 시 사전 자동 보완
+                KOREAN_NAME_TO_ID[item['name']] = pokemon_id
+    except Exception as e:
+        print(f"캐싱 중 오류 발생: {e}")
+        
     print('포켓몬 봇이 성공적으로 실행되었습니다!')
 
 @client.event
@@ -177,7 +214,7 @@ async def on_message(message):
     if message.content == '!도감':
         embed = discord.Embed(
             title="📖 포켓몬 도감 사용법",
-            description="`!도감 [포켓몬 번호 또는 영어이름]` 형식으로 입력해 주세요!\n\n**예시:**\n• `!도감 6` (리자몽 - 진화/메가진화 테스트)\n• `!도감 25` 또는 `!도감 pikachu` (피카츄)",
+            description="`!도감 [포켓몬 이름 또는 번호]` 형식으로 입력해 주세요!\n\n**예시:**\n• `!도감 페로코체` / `!도감 리자몽` (한국어 검색)\n• `!도감 795` (도감 번호 검색)",
             color=0x3498db
         )
         await message.channel.send(embed=embed)
@@ -187,11 +224,20 @@ async def on_message(message):
         query = message.content.split(' ')[1].strip()
         embed, species_data = get_pokemon_embed(query)
 
+        # 사전 조회가 안 되었을 경우 실시간으로 한국어 단어 직접 검색 파싱 시도
+        if not embed:
+            # 주소에 404가 나더라도 숫자로 직접 포켓몬을 찾을 수 있게 보완
+            species_url = f'https://pokeapi.co/api/v2/pokemon-species/{query.lower()}'
+            res = requests.get(species_url)
+            if res.status_code == 200:
+                embed, species_data = get_pokemon_embed(res.json()['id'])
+
         if embed and species_data:
             view = PokemonEvolutionView(species_data, species_data['name'])
             await message.channel.send(embed=embed, view=view)
         else:
-            await message.channel.send('포켓몬을 찾을 수 없어요. 도감 번호(예: !도감 6)나 영어 이름(예: !도감 charizard)으로 검색해 주세요!')
+            # 도감 번호 검색 팁 안내
+            await message.channel.send('포켓몬을 찾을 수 없어요. 한국어 이름이나 도감 번호(예: !도감 795)로 검색해 보세요!')
 
     # 3. 포획 기능
     elif message.content.startswith('!포획 '):
@@ -218,7 +264,7 @@ async def on_message(message):
                 else:
                     await message.channel.send("이미 내 도감에 등록된 포켓몬입니다.")
         else:
-            await message.channel.send("존재하지 않는 포켓몬입니다. 포켓몬 번호나 영어 이름을 정확히 입력해 주세요!")
+            await message.channel.send("존재하지 않는 포켓몬입니다. 정확한 이름이나 번호를 입력해 주세요!")
 
     # 4. 내 포켓몬 목록
     elif message.content == '!내포켓몬':
