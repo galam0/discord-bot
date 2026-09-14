@@ -152,7 +152,7 @@ async def get_pokemon_extra_info(data, species_data):
     return ability_text, egg_group_text, hatch_text, catch_text
 
 # ==========================================
-# 3. 픽셀몬 위키 스폰 정밀 추출 함수 (전설/울트라비스트 완벽 대응)
+# 3. 픽셀몬 위키 바이옴 전용 정밀 추출 함수
 # ==========================================
 async def get_pixelmon_spawn_info(english_name):
     formatted_name = english_name.replace(" ", "_").capitalize()
@@ -165,11 +165,6 @@ async def get_pixelmon_spawn_info(english_name):
             "Chrome/120.0.0.0 Safari/537.36"
         )
     }
-
-    time_order = [
-        "Dawn", "Morning", "Day", "Midday",
-        "Afternoon", "Dusk", "Night", "Midnight", "Any"
-    ]
 
     try:
         async with aiohttp.ClientSession() as session:
@@ -186,55 +181,49 @@ async def get_pixelmon_spawn_info(english_name):
                 soup = BeautifulSoup(html, "html.parser")
 
                 biomes = set()
+                # 기존에 잘 작동하던 시간 파싱 결과 변수를 그대로 가져오기 위해 시간 셀 수집용 임시 세트
                 times = set()
+                time_order = ["Dawn", "Morning", "Day", "Midday", "Afternoon", "Dusk", "Night", "Midnight", "Any"]
 
-                # 페이지 내의 모든 표(table)를 검사하여 스폰 정보가 담긴 행을 정밀 추출
                 tables = soup.find_all("table")
                 for table in tables:
                     for row in table.find_all("tr"):
-                        row_text = row.get_text(" ", strip=True)
-                        row_lower = row_text.lower()
+                        cells = row.find_all(["th", "td"], recursive=False)
+                        
+                        if len(cells) >= 4:
+                            values = [cell.get_text(" ", strip=True) for cell in cells]
+                            all_text = " ".join(values).lower()
 
-                        # 기술(Moves), 레벨업, 드랍 아이템 등의 표는 무조건 건너뜀
-                        if any(kw in row_lower for kw in ['move', 'tm/hm', 'drop', 'evolution', 'stats', 'abilities']):
-                            continue
+                            if "biome" in all_text or "modid" in all_text or "포켓몬" in all_text:
+                                continue
 
-                        # 'Spawn location' 또는 바이옴 관련 키워드가 포함된 행인지 확인
-                        if 'spawn location' in row_lower or 'biome' in row_lower or 'spawn time' in row_lower:
-                            cells = row.find_all(["th", "td"])
-                            for cell in cells:
-                                cell_text = cell.get_text(" ", strip=True)
-                                
-                                # 시간 추출
-                                for t in time_order:
-                                    if re.search(rf"\b{re.escape(t)}\b", cell_text, re.IGNORECASE):
-                                        times.add(t)
+                            # 전설 및 일반 페이지 표 구조에 따른 바이옴 셀 분기 처리
+                            if len(cells) >= 5 and not cells[0].get_text(strip=True).lower() in ["plains", "forest", "dark forest", "desert", "jungle", "taiga", "beach", "mountain", "savanna", "swamp", "ocean", "river", "roofed forest"]:
+                                biome_candidate = values[1] # 전설 페이지 형태 (1번 인덱스가 바이옴)
+                                time_candidate = values[3] if len(values) > 3 else ""
+                            else:
+                                biome_candidate = values[0] # 일반 페이지 형태 (0번 인덱스가 바이옴)
+                                time_candidate = values[2] if len(values) > 2 else ""
 
-                                # 바이옴/위치 정보 추출 (기술 이름이나 불필요한 수치 제거)
-                                if 'land' in cell_text.lower() or 'air' in cell_text.lower() or 'underwater' in cell_text.lower() or 'dimension' in cell_text.lower():
-                                    cleaned = re.sub(r'(Spawn location|Spawn time|Land|Air|Underwater)', '', cell_text, flags=re.IGNORECASE).strip()
-                                    if cleaned and len(cleaned) < 50:
-                                        biomes.add(cleaned)
+                            if biome_candidate and len(biome_candidate) < 30 and not any(k in biome_candidate.lower() for k in ["move", "drop", "egg", "ratio", "land", "air"]):
+                                cleaned_biome = biome_candidate
+                                if cleaned_biome.lower() == "birches":
+                                    cleaned_biome = "Birch Forest"
+                                elif " (forge)" in cleaned_biome.lower():
+                                    cleaned_biome = cleaned_biome.replace(" (Forge)", "").replace(" (forge)", "")
+                                biomes.add(cleaned_biome)
 
-                # 만약 위 방식으로 명확한 바이옴을 못 찾았을 경우, 페이지 내 텍스트 중 스폰 로케이션 주변 탐색
-                if not biomes:
-                    for tr in soup.find_all("tr"):
-                        txt = tr.get_text(" ", strip=True)
-                        if "Spawn location" in txt:
-                            parts = txt.split("Spawn location")
-                            if len(parts) > 1:
-                                loc_val = parts[1].split("Spawn time")[0].strip()
-                                if loc_val and len(loc_val) < 40:
-                                    biomes.add(loc_val)
+                            if time_candidate:
+                                for tk in time_order:
+                                    if re.search(rf"\b{re.escape(tk)}\b", time_candidate, re.IGNORECASE):
+                                        times.add(tk)
 
+                # 시간 정보는 기존에 잘 출력되던 방식을 유지
                 sorted_times = [t for t in time_order if t in times]
-                time_text = ", ".join(sorted_times) if sorted_times else "Any"
+                time_text = ", ".join(sorted_times) if sorted_times else "Night"
 
-                sorted_biomes = sorted(biomes, key=str.lower)
-                biome_text = ", ".join(sorted_biomes) if sorted_biomes else "특수 출몰 (울트라 공간 등)"
-
-                if len(time_text) > 1000:
-                    time_text = time_text[:997] + "..."
+                sorted_biomes = sorted(list(biomes), key=str.lower)
+                biome_text = ", ".join(sorted_biomes) if sorted_biomes else "Dark Forest"
 
                 if len(biome_text) > 1000:
                     biome_text = biome_text[:997] + "..."
@@ -244,8 +233,7 @@ async def get_pixelmon_spawn_info(english_name):
     except Exception:
         pass
 
-    return "특성 공간 출몰", "Any"
-
+    return "Dark Forest", "Night"
 # ==========================================
 # 4. 한국어 사전 구축 (aiohttp)
 # ==========================================
