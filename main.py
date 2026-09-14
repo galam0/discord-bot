@@ -177,16 +177,42 @@ def normalize_wiki_name(name):
 
 
 def clean_biome_text(text):
-    """바이옴 셀의 불필요한 표기만 정리합니다."""
+    """바이옴 셀의 불필요한 표기를 정리하고 보기 쉽게 다듬습니다."""
     if not text:
         return ""
 
     text = re.sub(r"\s+", " ", text).strip()
 
-    # Pixelmon 위키의 Forge 표기를 깔끔하게 표시
+    # Pixelmon 위키의 Forge 표기 및 불필요한 태그 제거
     text = re.sub(r"\s*\(Forge\)", "", text, flags=re.IGNORECASE)
+    text = re.sub(r"\s*\(Mod\)", "", text, flags=re.IGNORECASE)
 
-    if text.lower() == "birches":
+    # 자주 쓰이는 영문 바이옴 이름을 한글/친숙한 명칭으로 매핑 (원하시면 영어 유지 채택 가능)
+    biome_mapping = {
+        "birches": "Birch Forest (자작나무 숲)",
+        "plains": "Plains (평원)",
+        "forest": "Forest (숲)",
+        "dark forest": "Dark Forest (어두운 숲)",
+        "desert": "Desert (사막)",
+        "jungle": "Jungle (정글)",
+        "taiga": "Taiga (타이거)",
+        "swamp": "Swamp (습지)",
+        "beach": "Beach (해변)",
+        "mountain": "Mountain (산)",
+        "savanna": "Savanna (사바나)",
+        "ocean": "Ocean (바다)",
+        "river": "River (강)",
+        "snowy": "Snowy Biome (눈 내리는 지형)",
+        "badlands": "Badlands (악지)",
+        "mushroom": "Mushroom Fields (버섯 섬)"
+    }
+
+    low_text = text.lower()
+    for eng, friendly in biome_mapping.items():
+        if low_text == eng:
+            return friendly
+
+    if low_text == "birches":
         text = "Birch Forest"
 
     return text
