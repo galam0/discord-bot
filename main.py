@@ -1,233 +1,128 @@
-import os
 import discord
-from discord import app_commands
-from discord.ext import commands
+import os
+import requests
+from pymongo import MongoClient
 from flask import Flask
 from threading import Thread
-import requests
 
-intents = discord.Intents.default()
-intents.message_content = True
-bot = commands.Bot(command_prefix="!", intents=intents)
-
-# 가짜 웹 서버 설정 (Render 유지용)
-app = Flask('')
+# 1. 24시간 유지를 위한 가짜 웹 서버 설정
+app = Flask(__name__)
 
 @app.route('/')
 def home():
-    return "I'm alive!"
+    return "포켓몬 봇이 24시간 온라인 상태입니다!"
 
-def run():
-    app.run(host='0.0.0.0', port=10000)
+def run_server():
+    # Render가 요구하는 웹 포트 설정
+    port = int(os.environ.get("PORT", 8080))
+    app.run(host='0.0.0.0', port=port)
 
 def keep_alive():
-    t = Thread(target=run)
+    t = Thread(target=run_server)
     t.start()
 
-# ----------------------------------------------------
-# [라이엇 인증 및 상점 로직 Class]
-# ----------------------------------------------------
-class ValorantAPI:
-    def __init__(self):
-        self.session = requests.Session()
-        self.headers = {'User-Agent': 'RiotClient/43.0.1.4195386.4190634 rso-auth (Windows;10;10.0.19041.1.256.64bit)'}
+# 2. 기존 디스코드 봇 및 DB 설정
+intents = discord.Intents.default()
+intents.message_content = True
+intents.members = True
+client = discord.Client(intents=intents)
 
-    def login(self, username, password, mfa_code=None):
-        auth_body = {
-            "client_id": "play-valorant-web-prod",
-            "nonce": "1",
-            "redirect_uri": "https://playvalorant.com/opt_in",
-            "response_type": "token id_token",
-        }
-        self.session.post('https://auth.riotgames.com/api/v1/authorization', json=auth_body, headers=self.headers)
-        
-        login_body = {
-            "type": "auth",
-            "username": username,
-            "password": password,
-            "remember": "true"
-        }
-        
-        res = self.session.put('https://auth.riotgames.com/api/v1/authorization', json=login_body, headers=self.headers).json()
-        print(f"[DEBUG] 라이엇 로그인 응답: {res}") # Render 대시보드 로그 확인용
+pokemon_ko = {
+    "이상해씨": 1, "파이리": 4, "꼬부기": 7, "피카츄": 25, 
+    "라이츄": 26, "잠만보": 143, "뮤츠": 150, "뮤": 151
+}
 
-        # 1. 이미 2FA 코드가 함께 전달되었을 때의 처리
-        if mfa_code:
-            mfa_body = {
-                "type": "multifactor",
-                "code": mfa_code,
-                "rememberDevice": True
-            }
-            res = self.session.put('https://auth.riotgames.com/api/v1/authorization', json=mfa_body, headers=self.headers).json()
-            print(f"[DEBUG] 2FA 제출 응답: {res}")
+mongo_uri = os.environ.get('MONGODB_URI')
+mongo_client = MongoClient(mongo_uri)
+db = mongo_client['pokemon_game']
+collection = db['users']
 
-        # 2. 2단계 인증(2FA) 감지 로직 강화
-        is_mfa = False
-        if res.get('type') == 'multifactor':
-            is_mfa = True
-        elif res.get('error') == 'multifactor_attempt':
-            is_mfa = True
-        elif 'response' in res and 'parameters' in res['response']:
-            uri_str = str(res['response']['parameters'])
-            if 'multifactor' in uri_str or 'sub-multifactor' in uri_str:
-                is_mfa = True
-
-        if is_mfa:
-            return "2FA_REQUIRED", None
-
-        # 3. 일반 로그인 실패 처리
-        if 'error' in res or 'response' not in res or 'parameters' not in res.get('response', {}):
-            return "ERROR", "❌ 로그인 실패: 아이디/비밀번호가 틀렸거나 2FA 인증에 실패했습니다."
-
-        try:
-            uri = res['response']['parameters']['uri']
-            access_token = uri.split('access_token=')[1].split('&')[0]
-
-            ent_res = self.session.post(
-                'https://entitlements.auth.riotgames.com/api/token/v1', 
-                headers={'Authorization': f'Bearer {access_token}'}
-            ).json()
-            entitlements_token = ent_res['entitlements_token']
-
-            user_res = self.session.post(
-                'https://auth.riotgames.com/userinfo', 
-                headers={'Authorization': f'Bearer {access_token}'}
-            ).json()
-            puuid = user_res['sub']
-
-            # 상점 정보 요청
-            shop_headers = {
-                'Authorization': f'Bearer {access_token}',
-                'X-Riot-Entitlements-JWT': entitlements_token,
-            }
-            shop_url = f'https://pd.kr.a.pvp.net/store/v2/storefront/{puuid}'
-            shop_data = self.session.get(shop_url, headers=shop_headers).json()
-
-            single_item_offers = shop_data['SkinsPanelLayout']['SingleItemOffers']
-            
-            skins_info = []
-            for skin_id in single_item_offers:
-                skin_res = requests.get(f'https://valorant-api.com/v1/weapons/skinlevels/{skin_id}?language=ko-KR').json()
-                if skin_res['status'] == 200:
-                    skins_info.append({
-                        'name': skin_res['data']['displayName'],
-                        'icon': skin_res['data']['displayIcon']
-                    })
-
-            return "SUCCESS", skins_info
-        except Exception as e:
-            return "ERROR", f"❌ 상점 정보 처리 중 오류가 발생했습니다: {e}"
-
-# ----------------------------------------------------
-# [2단계 인증(2FA) 입력 모달]
-# ----------------------------------------------------
-class TwoFactorModal(discord.ui.Modal, title="2단계 인증(2FA) 코드 입력"):
-    code = discord.ui.TextInput(
-        label="이메일로 전송된 6자리 인증 코드",
-        placeholder="123456",
-        required=True,
-        max_length=6
-    )
-
-    def __init__(self, username, password):
-        super().__init__()
-        self.username = username
-        self.password = password
-
-    async def on_submit(self, interaction: discord.Interaction):
-        await interaction.response.defer(ephemeral=True)
-        
-        api = ValorantAPI()
-        status, result = api.login(self.username, self.password, mfa_code=self.code.value)
-        
-        if status == "ERROR":
-            await interaction.followup.send(content=result, ephemeral=True)
-            return
-
-        embed = discord.Embed(
-            title="🛒 오늘의 발로란트 일일 상점", 
-            color=discord.Color.red(),
-            description="본인에게만 보이는 상점 정보입니다."
-        )
-        for idx, skin in enumerate(result, 1):
-            embed.add_field(name=f"{idx}. {skin['name']}", value="\u200b", inline=False)
-        if result and result[-1]['icon']:
-            embed.set_thumbnail(url=result[-1]['icon'])
-
-        await interaction.followup.send(embed=embed, ephemeral=True)
-
-# ----------------------------------------------------
-# [기본 로그인 모달]
-# ----------------------------------------------------
-class ValorantAuthModal(discord.ui.Modal, title="발로란트 로그인"):
-    username = discord.ui.TextInput(label="라이엇 계정 ID", placeholder="아이디를 입력하세요", required=True)
-    password = discord.ui.TextInput(label="비밀번호", placeholder="비밀번호를 입력하세요", style=discord.TextStyle.short, required=True)
-
-    async def on_submit(self, interaction: discord.Interaction):
-        api = ValorantAPI()
-        status, result = api.login(self.username.value, self.password.value)
-
-        # 2단계 인증 요구 감지 시 2차 입력 모달 팝업 표시
-        if status == "2FA_REQUIRED":
-            await interaction.response.send_modal(
-                TwoFactorModal(username=self.username.value, password=self.password.value)
-            )
-            return
-
-        await interaction.response.defer(ephemeral=True)
-
-        if status == "ERROR":
-            await interaction.followup.send(content=result, ephemeral=True)
-            return
-
-        embed = discord.Embed(
-            title="🛒 오늘의 발로란트 일일 상점", 
-            color=discord.Color.red(),
-            description="본인에게만 보이는 상점 정보입니다."
-        )
-        for idx, skin in enumerate(result, 1):
-            embed.add_field(name=f"{idx}. {skin['name']}", value="\u200b", inline=False)
-        if result and result[-1]['icon']:
-            embed.set_thumbnail(url=result[-1]['icon'])
-
-        await interaction.followup.send(embed=embed, ephemeral=True)
-
-# ----------------------------------------------------
-# [디스코드 이벤트 및 명령어]
-# ----------------------------------------------------
-@bot.event
+@client.event
 async def on_ready():
-    print(f"🤖 봇 로그인 성공: {bot.user.name}")
-    try:
-        synced = await bot.tree.sync()
-        print(f"✨ {len(synced)}개 명령어 동기화 완료")
-    except Exception as e:
-        print(f"❌ 동기화 에러: {e}")
+    print('웹 서비스가 연결된 포켓몬 봇이 켜졌습니다!')
 
-@bot.tree.command(name="ping", description="봇이 살아있는지 확인합니다.")
-async def ping(interaction: discord.Interaction):
-    await interaction.response.send_message("Pong! I'm here.")
+@client.event
+async def on_message(message):
+    if message.author == client.user:
+        return
 
-@bot.tree.command(name="join", description="음성 채널에 접속합니다.")
-async def join(interaction: discord.Interaction):
-    if interaction.user.voice and interaction.user.voice.channel:
-        voice_channel = interaction.user.voice.channel
-        if interaction.guild.voice_client:
-            await interaction.guild.voice_client.move_to(voice_channel)
+    if message.content.startswith('!도감 '):
+        search_query = message.content.split(' ')[1]
+        display_name = search_query 
+
+        if search_query in pokemon_ko:
+            search_query = str(pokemon_ko[search_query])
         else:
-            await voice_channel.connect()
-        await interaction.response.send_message(f"🎤 {voice_channel.name} 접속 완료!")
-    else:
-        await interaction.response.send_message("⚠️ 음성 채널에 먼저 입장해 주세요.", ephemeral=True)
+            display_name = search_query.capitalize()
 
-@bot.tree.command(name="상점", description="오늘 내 발로란트 상점을 확인합니다.")
-async def shop_command(interaction: discord.Interaction):
-    await interaction.response.send_modal(ValorantAuthModal())
+        url = f'https://pokeapi.co/api/v2/pokemon/{search_query.lower()}'
+        response = requests.get(url)
+        
+        if response.status_code == 200:
+            data = response.json()
+            height = data['height'] / 10
+            weight = data['weight'] / 10
+            image_url = data['sprites']['front_default']
+            
+            embed = discord.Embed(title=f"포켓몬 정보: {display_name}", color=0xcc0000)
+            embed.set_thumbnail(url=image_url)
+            embed.add_field(name="도감 번호", value=f"No.{data['id']}", inline=False)
+            embed.add_field(name="키", value=f"{height}m", inline=True)
+            embed.add_field(name="몸무게", value=f"{weight}kg", inline=True)
+            
+            await message.channel.send(embed=embed)
+        else:
+            await message.channel.send('포켓몬을 찾을 수 없어요.')
 
+    if message.content.startswith('!포획 '):
+        pokemon_name = message.content.split(' ')[1]
+        user_id = str(message.author.id)
+        
+        user_data = collection.find_one({"_id": user_id})
+        
+        if not user_data:
+            collection.insert_one({"_id": user_id, "pokemon_list": [pokemon_name]})
+            await message.channel.send(f"🎉 앗! 야생의 **{pokemon_name}**(을)를 잡았다! (첫 포획!)")
+        else:
+            if pokemon_name not in user_data["pokemon_list"]:
+                collection.update_one({"_id": user_id}, {"$push": {"pokemon_list": pokemon_name}})
+                await message.channel.send(f"🎉 앗! 야생의 **{pokemon_name}**(을)를 잡았다! (내 도감에 저장됨)")
+            else:
+                await message.channel.send("이미 도감에 등록된 포켓몬입니다.")
+
+    if message.content == '!내포켓몬':
+        user_id = str(message.author.id)
+        user_data = collection.find_one({"_id": user_id})
+        
+        if user_data and len(user_data["pokemon_list"]) > 0:
+            pokemon_list = ", ".join(user_data["pokemon_list"])
+            await message.channel.send(f"📖 **{message.author.display_name}님의 포켓몬 도감**\n{pokemon_list}")
+        else:
+            await message.channel.send("아직 잡은 포켓몬이 없습니다.")
+
+    if message.content == '!순위':
+        all_users = collection.find()
+        ranking = []
+        for user in all_users:
+            count = len(user.get("pokemon_list", []))
+            ranking.append((user["_id"], count))
+        
+        if not ranking:
+            await message.channel.send("아직 포켓몬을 잡은 사람이 아무도 없습니다!")
+            return
+        
+        ranking.sort(key=lambda x: x[1], reverse=True)
+        embed = discord.Embed(title="🏆 포켓몬 헌터 순위 TOP 5", color=0xffd700)
+        
+        for i, (user_id, count) in enumerate(ranking[:5]):
+            discord_user = client.get_user(int(user_id))
+            name = discord_user.display_name if discord_user else "알 수 없는 헌터"
+            medals = ["🥇", "🥈", "🥉", "🏅", "🏅"]
+            medal = medals[i]
+            embed.add_field(name=f"{medal} {i+1}위: {name}", value=f"총 {count}마리 포획", inline=False)
+            
+        await message.channel.send(embed=embed)
+
+# 3. 봇을 켜기 전에 웹 서버(가짜 웹사이트)를 먼저 실행합니다.
 keep_alive()
-
-TOKEN = os.environ.get("DISCORD_BOT_TOKEN")
-if TOKEN:
-    bot.run(TOKEN)
-else:
-    print("❌ DISCORD_BOT_TOKEN 환경변수가 설정되지 않았습니다.")
+client.run(os.environ.get('DISCORD_TOKEN'))
