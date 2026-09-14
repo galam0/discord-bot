@@ -152,7 +152,7 @@ async def get_pokemon_extra_info(data, species_data):
     return ability_text, egg_group_text, hatch_text, catch_text
 
 # ==========================================
-# 3. 픽셀몬 위키 바이옴 정돈 및 정제 함수
+# 3. 픽셀몬 위키 바이옴 정돈 및 정제 함수 (전설/환상 포켓몬 대응 강화)
 # ==========================================
 async def get_pixelmon_spawn_info(english_name):
     formatted_name = english_name.replace(" ", "_").capitalize()
@@ -187,52 +187,51 @@ async def get_pixelmon_spawn_info(english_name):
 
                 spawn_heading = None
 
+                # 일반 'Spawn Biomes'뿐만 아니라 전설/특수 포켓몬이 사용하는 헤더 키워드까지 포괄적으로 탐색
                 for heading in soup.find_all(["h2", "h3", "h4"]):
                     title = heading.get_text(" ", strip=True).lower()
-                    if "spawn biomes" in title:
+                    if "spawn biomes" in title or "spawns" in title or "legendary" in title:
                         spawn_heading = heading
                         break
 
+                # 위키 내에 스폰 관련 헤더를 못 찾았을 경우 페이지 내 모든 표를 대상으로 강제 탐색 시도
                 if spawn_heading is None:
-                    return "정보 없음", "Any"
+                    target_tables = soup.find_all("table")
+                else:
+                    target_tables = []
+                    current = spawn_heading
+                    while True:
+                        current = current.find_next()
+                        if current is None:
+                            break
+                        if current.name == "h2":
+                            break
+                        if current.name == "table":
+                            target_tables.append(current)
 
                 biomes = set()
                 times = set()
-                current = spawn_heading
 
-                while True:
-                    current = current.find_next()
-
-                    if current is None:
-                        break
-                    if current.name == "h2":
-                        break
-                    if current.name != "table":
-                        continue
-
-                    for row in current.find_all("tr"):
+                for table in target_tables:
+                    for row in table.find_all("tr"):
                         cells = row.find_all(["th", "td"], recursive=False)
-                        if len(cells) < 3:
+                        if len(cells) < 2:
                             continue
 
                         values = [cell.get_text(" ", strip=True) for cell in cells]
                         if not any(values):
                             continue
 
-                        first = values[0].strip().lower()
                         all_text = " ".join(values).strip().lower()
 
-                        if "biome" in all_text and "modid" in all_text and "time" in all_text:
-                            continue
-
-                        if first in {"biome", "modid", "time", "location", "condition", "rarity"}:
+                        if "biome" in all_text and "modid" in all_text:
                             continue
 
                         biome_raw = values[0].strip()
-                        spawn_time = values[2].strip()
+                        # 보통 시간이 포함된 셀의 인덱스를 유연하게 탐색
+                        spawn_time = values[2].strip() if len(values) > 2 else ""
 
-                        if biome_raw:
-                            # 픽셀몬 위키의 어색한 시스템 명칭 정돈 (Birches -> Birch Forest 등)
+                        if biome_raw and biome_raw.lower() not in {"biome", "modid", "time", "location", "condition", "rarity"}:
                             cleaned_biome = biome_raw
                             if cleaned_biome.lower() == "birches":
                                 cleaned_biome = "Birch Forest"
