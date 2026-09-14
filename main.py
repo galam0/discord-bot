@@ -51,7 +51,7 @@ TYPE_KO = {
 }
 
 # ==========================================
-# 3. 픽셀몬 위키 스크래핑 정밀화 및 텍스트 정제 함수 (완전 업그레이드)
+# 3. 픽셀몬 위키 마인크래프트 바이옴 정밀 추출 함수
 # ==========================================
 async def get_pixelmon_spawn_info(english_name):
     formatted_name = english_name.capitalize()
@@ -60,6 +60,15 @@ async def get_pixelmon_spawn_info(english_name):
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
     }
+
+    # 마인크래프트/픽셀몬에서 실제 바이옴으로 인정되는 단어들
+    valid_biome_keywords = [
+        'forest', 'plains', 'taiga', 'desert', 'jungle', 'swamp', 'beach', 
+        'mountain', 'hills', 'mesa', 'badlands', 'savanna', 'river', 'ocean', 
+        'deep', 'snowy', 'frozen', 'ice', 'mushroom', 'flower', 'roofed', 
+        'birch', 'dark', 'windswept', 'stony', 'dripstone', 'lush', 'grove', 
+        'meadow', 'jagged', 'stony', 'cherry', 'mangrove', 'nether', 'end', 'hell'
+    ]
 
     try:
         async with aiohttp.ClientSession() as session:
@@ -71,55 +80,38 @@ async def get_pixelmon_spawn_info(english_name):
                     biomes = set()
                     times = set()
 
-                    # 걸러내야 할 불필요한 조건 문구 및 키워드 목록
-                    ignore_phrases = [
-                        'biome', 'biomes', 'modid', 'time', 'times', 'location', 
-                        'condition', 'rarity', 'spawn time', 'level range in wild', 
-                        'level', 'range', 'in', 'wild', 'spawn rate', 'rate', 'rain',
-                        'thunder', '2x', '1.5x', 'any', 'none', 'and', 'or'
-                    ]
+                    # 위키 테이블 셀(td)을 순회하며 실제 마인크래프트 바이옴 이름이 포함된 텍스트만 추출
+                    for td in soup.find_all('td'):
+                        text = td.get_text().strip()
+                        # 시간 관련 키워드 추출
+                        for t in ['Day', 'Night', 'Dawn', 'Dusk', 'Any']:
+                            if t.lower() in text.lower():
+                                times.add(t)
 
-                    tables = soup.find_all('table')
-                    for table in tables:
-                        rows = table.find_all('tr')
-                        for row in rows:
-                            text_nodes = [td.get_text().strip() for td in row.find_all(['td', 'th'])]
-                            header_line = " ".join(text_nodes).lower()
+                        # 쉼표나 슬래시로 쪼개서 개별 단어/구문 확인
+                        parts = re.split(r'[,/\n]+', text)
+                        for p in parts:
+                            p_clean = p.strip()
+                            p_lower = p_clean.lower()
+                            
+                            # 글자 수가 너무 짧거나 길지 않고, 유효한 바이옴 키워드가 포함된 경우만 허용
+                            if 3 <= len(p_clean) <= 30:
+                                if any(vk in p_lower for vk in valid_biome_keywords):
+                                    # 잘못 섞이는 시간/확률 관련 단어가 포함되어 있으면 제외
+                                    if not any(bad in p_lower for bad in ['afternoon', 'morning', 'spawn', 'rate', 'level', 'wild', 'bop', 'byg']):
+                                        biomes.add(p_clean)
 
-                            # 바이옴 데이터 수집
-                            if 'biome' in header_line:
-                                for td in row.find_all('td'):
-                                    val = td.get_text().strip()
-                                    # 쉼표나 줄바꿈 기준으로 쪼개서 개별 단어 단위로 검사
-                                    parts = re.split(r'[,/\n]+', val)
-                                    for p in parts:
-                                        p_clean = p.strip()
-                                        p_lower = p_clean.lower()
-                                        # 숫자들이거나 무의미한 조건 문구면 제외
-                                        if p_clean and p_lower not in ignore_phrases and not p_clean.isdigit():
-                                            if not any(ip in p_lower for ip in ['spawn', 'rate', 'level', 'condition', 'bop', 'byg']):
-                                                biomes.add(p_clean)
+                    final_biome = ", ".join(sorted(list(biomes))) if biomes else "Forest, Plains"
+                    final_time = ", ".join(sorted(list(times))) if times else "Night"
 
-                            # 출몰 시간 데이터 수집
-                            if 'time' in header_line:
-                                for td in row.find_all('td'):
-                                    val = td.get_text().strip()
-                                    for t in ['Day', 'Night', 'Dawn', 'Dusk', 'Any']:
-                                        if t.lower() in val.lower():
-                                            times.add(t)
-
-                    final_biome = ", ".join(sorted(list(biomes))) if biomes else "Plains, Forest"
-                    final_time = ", ".join(sorted(list(times))) if times else "Day"
-
-                    # 너무 길 경우 말줄임표 처리
-                    if len(final_biome) > 55:
-                        final_biome = final_biome[:52] + "..."
+                    if len(final_biome) > 60:
+                        final_biome = final_biome[:57] + "..."
 
                     return final_biome, final_time
     except Exception:
         pass
 
-    return "Plains, Forest", "Day"
+    return "Forest, Plains", "Night"
 # ==========================================
 # 4. 한국어 사전 구축 (aiohttp)
 # ==========================================
