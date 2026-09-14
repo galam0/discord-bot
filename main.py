@@ -50,15 +50,115 @@ TYPE_KO = {
     'steel': '⚙️ 강철', 'fairy': '✨ 페어리', 'dark': '🌙 악'
 }
 
+# 특성 한국어 캐시
+ABILITY_KO_CACHE = {}
+
+# 알 그룹 한국어 이름
+EGG_GROUP_KO = {
+    'monster': '괴수',
+    'water1': '수중 1',
+    'water2': '수중 2',
+    'water3': '수중 3',
+    'bug': '벌레',
+    'flying': '비행',
+    'field': '육상',
+    'fairy': '요정',
+    'grass': '식물',
+    'human-like': '인간형',
+    'mineral': '광물',
+    'amorphous': '부정형',
+    'dragon': '드래곤',
+    'undiscovered': '미발견',
+}
+
+async def get_ability_korean_name(session, ability_name):
+    """PokeAPI에서 특성의 한국어 이름을 가져옵니다."""
+    key = ability_name.lower()
+
+    if key in ABILITY_KO_CACHE:
+        return ABILITY_KO_CACHE[key]
+
+    try:
+        url = f"https://pokeapi.co/api/v2/ability/{key}"
+        async with session.get(url, timeout=8) as response:
+            if response.status == 200:
+                data = await response.json()
+
+                for name_entry in data.get('names', []):
+                    if name_entry.get('language', {}).get('name') == 'ko':
+                        korean_name = name_entry.get('name')
+                        if korean_name:
+                            ABILITY_KO_CACHE[key] = korean_name
+                            return korean_name
+    except Exception:
+        pass
+
+    # 한국어 데이터를 못 가져오면 영어 이름을 보기 좋게 표시
+    fallback = ability_name.replace('-', ' ').title()
+    ABILITY_KO_CACHE[key] = fallback
+    return fallback
+
+async def get_pokemon_extra_info(data, species_data):
+    """
+    사진처럼 표시할 부가 정보를 구성합니다.
+    키/몸무게는 사용하지 않습니다.
+    """
+    # 특성
+    ability_names = []
+    async with aiohttp.ClientSession() as session:
+        for ability_entry in data.get('abilities', []):
+            ability_name = ability_entry.get('ability', {}).get('name')
+            if ability_name:
+                korean_name = await get_ability_korean_name(session, ability_name)
+                if korean_name not in ability_names:
+                    ability_names.append(korean_name)
+
+    ability_text = ", ".join(ability_names) if ability_names else "정보 없음"
+
+    # 알 그룹
+    egg_groups = []
+    for group in species_data.get('egg_groups', []):
+        group_name = group.get('name', '')
+        korean_name = EGG_GROUP_KO.get(
+            group_name,
+            group_name.replace('-', ' ').title()
+        )
+
+        if korean_name and korean_name not in egg_groups:
+            egg_groups.append(korean_name)
+
+    egg_group_text = ", ".join(egg_groups) if egg_groups else "미발견"
+
+    # 부화 걸음 수
+    # PokeAPI의 hatch_counter = 부화 사이클
+    # 1 사이클 = 255 걸음 기준
+    hatch_counter = species_data.get('hatch_counter')
+    if hatch_counter is not None:
+        hatch_steps = hatch_counter * 255
+        hatch_text = f"{hatch_steps:,}"
+    else:
+        hatch_text = "정보 없음"
+
+    # 포획률
+    capture_rate = species_data.get('capture_rate')
+    catch_text = str(capture_rate) if capture_rate is not None else "정보 없음"
+
+    return ability_text, egg_group_text, hatch_text, catch_text
+
 # ==========================================
 # 3. 픽셀몬 위키 스폰 전용 테이블 정밀 추출 함수
 # ==========================================
 async def get_pixelmon_spawn_info(english_name):
     """
-    Pixelmon Wiki의 'Spawn Biomes' 표에서만 출몰 시간과 바이옴을 가져옵니다.
-    페이지 전체의 다른 표(Moves, Held item 등)는 절대 스캔하지 않습니다.
+    Pixelmon Wiki에서 실제 'Spawn Biomes' 표의
+    바이옴 이름과 출몰 시간만 정확하게 가져옵니다.
+
+    - Biome 열만 → 출몰 바이옴
+    - Time 열만 → 출몰 시간
+    - ModID / Location / Condition / Rarity / 헤더는 제외
+    - Spawn Biomes 아래에 여러 표가 있는 포켓몬도 지원
     """
-    formatted_name = english_name.capitalize()
+    formatted_name = english_name.replace(" ", "_").capitalize()
     wiki_url = f"https://pixelmonmod.com/wiki/{formatted_name}"
 
     headers = {
@@ -69,7 +169,7 @@ async def get_pixelmon_spawn_info(english_name):
         )
     }
 
-    # Pixelmon의 실제 Spawn Time 종류
+    # Pixelmon Wiki에서 사용하는 시간 순서
     time_order = [
         "Dawn", "Morning", "Day", "Midday",
         "Afternoon", "Dusk", "Night", "Midnight", "Any"
@@ -84,97 +184,156 @@ async def get_pixelmon_spawn_info(english_name):
             ) as response:
 
                 if response.status != 200:
-                    print(f"❌ 위키 접속 실패: {english_name} / HTTP {response.status}")
+                    print(
+                        f"❌ Pixelmon Wiki 접속 실패: "
+                        f"{english_name} / HTTP {response.status}"
+                    )
                     return "정보 없음", "Any"
 
                 html = await response.text()
                 soup = BeautifulSoup(html, "html.parser")
 
-                # ==========================================
-                # 1. 'Spawn Biomes' 섹션 제목을 정확히 찾기
-                # ==========================================
+                # ==================================================
+                # 1. Spawn Biomes 제목 찾기
+                # ==================================================
                 spawn_heading = None
 
                 for heading in soup.find_all(["h2", "h3", "h4"]):
-                    heading_text = heading.get_text(" ", strip=True).lower()
+                    title = heading.get_text(" ", strip=True).lower()
 
-                    if "spawn biomes" in heading_text:
+                    if "spawn biomes" in title:
                         spawn_heading = heading
                         break
 
                 if spawn_heading is None:
-                    print(f"⚠️ Spawn Biomes 섹션을 찾지 못함: {english_name}")
-                    return "정보 없음", "Any"
-
-                # ==========================================
-                # 2. Spawn Biomes 제목 바로 아래의 표만 사용
-                # ==========================================
-                spawn_table = spawn_heading.find_next("table")
-
-                if spawn_table is None:
-                    print(f"⚠️ Spawn Biomes 표를 찾지 못함: {english_name}")
+                    print(f"⚠️ Spawn Biomes 섹션 없음: {english_name}")
                     return "정보 없음", "Any"
 
                 biomes = set()
                 times = set()
 
-                # ==========================================
-                # 3. 표의 행을 분석
-                #
-                # 공식 표 구조:
-                # Biome | ModID | Time | Location | Condition | Rarity
-                # ==========================================
-                for row in spawn_table.find_all("tr"):
-                    cells = row.find_all(["th", "td"])
+                # ==================================================
+                # 2. Spawn Biomes 섹션 안의 모든 표만 가져오기
+                #    다음 h2가 나오면 Spawn Biomes 영역 종료
+                # ==================================================
+                current = spawn_heading
 
-                    if len(cells) < 3:
+                while True:
+                    current = current.find_next()
+
+                    if current is None:
+                        break
+
+                    # 다음 큰 섹션이면 종료
+                    if current.name == "h2":
+                        break
+
+                    if current.name != "table":
                         continue
 
-                    values = [
-                        cell.get_text(" ", strip=True)
-                        for cell in cells
-                    ]
+                    # ------------------------------------------------
+                    # 3. 표의 행 하나씩 처리
+                    # ------------------------------------------------
+                    for row in current.find_all("tr"):
+                        # recursive=False로 '현재 행의 직접적인 셀'만 가져옴
+                        cells = row.find_all(
+                            ["th", "td"],
+                            recursive=False
+                        )
 
-                    # 헤더 행 무시
-                    if values[0].strip().lower() == "biome":
-                        continue
+                        if len(cells) < 3:
+                            continue
 
-                    biome = values[0].strip()
-                    spawn_time = values[2].strip()
+                        values = [
+                            cell.get_text(" ", strip=True)
+                            for cell in cells
+                        ]
 
-                    # 바이옴 저장
-                    if biome:
-                        biomes.add(biome)
+                        # 빈 행 무시
+                        if not any(values):
+                            continue
 
-                    # 출몰 시간 저장
-                    if spawn_time:
-                        # 여러 시간이 한 셀에 들어오는 경우도 대비
-                        for time_name in time_order:
-                            if re.search(
-                                rf"\b{re.escape(time_name)}\b",
-                                spawn_time,
-                                re.IGNORECASE
-                            ):
-                                times.add(time_name)
+                        first = values[0].strip().lower()
+                        all_text = " ".join(values).strip().lower()
 
-                # ==========================================
-                # 4. 표시 순서 정리
-                # ==========================================
+                        # ==================================================
+                        # 헤더 행 제거
+                        # "Biome ModID Time Location Condition Rarity"
+                        # ==================================================
+                        if (
+                            "biome" in all_text
+                            and "modid" in all_text
+                            and "time" in all_text
+                        ):
+                            continue
+
+                        # 첫 번째 셀이 명백한 헤더면 제거
+                        if first in {
+                            "biome",
+                            "modid",
+                            "time",
+                            "location",
+                            "condition",
+                            "rarity"
+                        }:
+                            continue
+
+                        # ==================================================
+                        # 실제 데이터
+                        #
+                        # [0] Biome
+                        # [1] ModID
+                        # [2] Time
+                        # [3] Location
+                        # [4] Condition
+                        # [5] Rarity
+                        # ==================================================
+                        biome = values[0].strip()
+                        spawn_time = values[2].strip()
+
+                        # 바이옴 이름만 저장
+                        if biome:
+                            biomes.add(biome)
+
+                        # 출몰 시간만 저장
+                        if spawn_time:
+                            for time_name in time_order:
+                                if re.search(
+                                    rf"\b{re.escape(time_name)}\b",
+                                    spawn_time,
+                                    re.IGNORECASE
+                                ):
+                                    times.add(time_name)
+
+                # ==================================================
+                # 4. 시간 정렬
+                # ==================================================
                 sorted_times = [
-                    time_name
-                    for time_name in time_order
-                    if time_name in times
+                    t for t in time_order
+                    if t in times
                 ]
 
-                # 바이옴은 알파벳순으로 정렬
-                sorted_biomes = sorted(biomes, key=str.lower)
+                time_text = (
+                    ", ".join(sorted_times)
+                    if sorted_times
+                    else "Any"
+                )
 
-                time_text = ", ".join(sorted_times) if sorted_times else "Any"
-                biome_text = ", ".join(sorted_biomes) if sorted_biomes else "정보 없음"
+                # ==================================================
+                # 5. 바이옴 중복 제거 + 정렬
+                # ==================================================
+                sorted_biomes = sorted(
+                    biomes,
+                    key=str.lower
+                )
 
-                # ==========================================
-                # 5. Discord Embed field 길이 보호
-                # ==========================================
+                biome_text = (
+                    ", ".join(sorted_biomes)
+                    if sorted_biomes
+                    else "정보 없음"
+                )
+
+                # Discord Embed field 최대 길이 보호
                 if len(time_text) > 1000:
                     time_text = time_text[:997] + "..."
 
@@ -182,14 +341,18 @@ async def get_pixelmon_spawn_info(english_name):
                     biome_text = biome_text[:997] + "..."
 
                 print(
-                    f"✅ {english_name}: "
-                    f"시간=[{time_text}] / 바이옴=[{biome_text}]"
+                    f"✅ {english_name}\n"
+                    f"   ⏳ 시간: {time_text}\n"
+                    f"   🍄 바이옴: {biome_text}"
                 )
 
                 return biome_text, time_text
 
     except Exception as e:
-        print(f"❌ Pixelmon 스폰 정보 오류: {english_name} / {e}")
+        print(
+            f"❌ Pixelmon 스폰 정보 오류: "
+            f"{english_name} / {type(e).__name__}: {e}"
+        )
 
     return "정보 없음", "Any"
 
@@ -282,8 +445,6 @@ async def get_pokemon_embed_async(pokemon_id_or_name):
         return None, None
         
     data = detail_res.json()
-    height = data['height'] / 10
-    weight = data['weight'] / 10
     image_url = data['sprites']['other']['official-artwork']['front_default'] or data['sprites']['front_default']
 
     if 'alola' in query:
@@ -325,15 +486,71 @@ async def get_pokemon_embed_async(pokemon_id_or_name):
 
     biome_info, time_info = await get_pixelmon_spawn_info(english_name)
 
-    embed = discord.Embed(title=f"포켓몬 정보: {display_name}", color=0xcc0000)
+    # 사진처럼 표시할 부가 정보
+    ability_text, egg_group_text, hatch_text, catch_text = (
+        await get_pokemon_extra_info(data, species_data)
+    )
+
+    embed = discord.Embed(
+        title=f"포켓몬 정보: {display_name}",
+        color=0xcc0000
+    )
     embed.set_thumbnail(url=image_url)
-    embed.add_field(name="도감 번호", value=f"No.{species_data['id']}", inline=False)
-    embed.add_field(name="타입", value=types_str, inline=False)
-    embed.add_field(name="키", value=f"{height}m", inline=True)
-    embed.add_field(name="몸무게", value=f"{weight}kg", inline=True)
-    embed.add_field(name="⏳ 출몰 시간", value=time_info, inline=True)
-    embed.add_field(name="🍄 출몰 바이옴", value=biome_info, inline=True)
-    embed.add_field(name="🌸 종족치", value=stats_table, inline=False)
+
+    # 도감 번호
+    embed.add_field(
+        name="📖 도감 번호",
+        value=f"No.{species_data['id']}",
+        inline=False
+    )
+
+    # 1번째 줄
+    embed.add_field(
+        name="⚔️ 타입",
+        value=types_str,
+        inline=True
+    )
+    embed.add_field(
+        name="🛡️ 특성",
+        value=ability_text,
+        inline=True
+    )
+    embed.add_field(
+        name="🥚 알 그룹",
+        value=egg_group_text,
+        inline=True
+    )
+
+    # 2번째 줄
+    embed.add_field(
+        name="🐣 부화 걸음 수",
+        value=hatch_text,
+        inline=True
+    )
+    embed.add_field(
+        name="🟣 포획률",
+        value=catch_text,
+        inline=True
+    )
+    embed.add_field(
+        name="⏳ 출몰 시간",
+        value=time_info,
+        inline=True
+    )
+
+    # 3번째 줄
+    embed.add_field(
+        name="🍄 출몰 바이옴",
+        value=biome_info,
+        inline=True
+    )
+
+    # 종족치
+    embed.add_field(
+        name="🌸 종족치",
+        value=stats_table,
+        inline=False
+    )
 
     return embed, species_data
 
