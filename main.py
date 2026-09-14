@@ -684,7 +684,14 @@ async def on_message(message):
         if embed and species_data:
             base_name = species_data['name']
             view = PokemonEvolutionView(species_data, base_name, base_name)
-            await message.channel.send(embed=embed, view=view)
+            try:
+                await message.channel.send(embed=embed, view=view)
+            except discord.HTTPException as e:
+                if e.status == 429:
+                    await asyncio.sleep(2)  # 429 발생 시 2초 대기 후 재시도
+                    await message.channel.send(embed=embed, view=view)
+                else:
+                    raise e
         else:
             await message.channel.send('포켓몬을 찾을 수 없어요. 포켓몬 이름이나 번호를 정확히 입력해 주세요!')
 
