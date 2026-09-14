@@ -1,6 +1,8 @@
 import discord
 import os
 import requests
+import aiohttp
+import asyncio
 from pymongo import MongoClient
 from flask import Flask
 from threading import Thread
@@ -48,20 +50,45 @@ TYPE_KO = {
 }
 
 # ==========================================
-# 3. 입력값(한국어/영어/숫자) -> 도감 ID 변환
+# 3. 비동기 포켓몬 한국어 사전 초속 구축 (aiohttp)
+# ==========================================
+async def fetch_species_name(session, item):
+    try:
+        async with session.get(item['url']) as response:
+            if response.status == 200:
+                data = await response.json()
+                p_id = str(data['id'])
+                for n in data.get('names', []):
+                    if n['language']['name'] == 'ko':
+                        POKEMON_KO_TO_ID[n['name'].lower()] = p_id
+                        break
+    except Exception:
+        pass
+
+async def build_korean_cache():
+    print('🔄 비동기로 전체 포켓몬 한국어 데이터베이스를 수집 중입니다...')
+    async with aiohttp.ClientSession() as session:
+        async with session.get('https://pokeapi.co/api/v2/pokemon-species?limit=1025') as response:
+            if response.status == 200:
+                data = await response.json()
+                results = data['results']
+                # 1025개 요청을 병렬로 동시에 실행하여 2초만에 완료
+                tasks = [fetch_species_name(session, item) for item in results]
+                await asyncio.gather(*tasks)
+    print(f"✅ 총 {len(POKEMON_KO_TO_ID)}마리 포켓몬의 한국어 이름 등록이 완료되었습니다!")
+
+# ==========================================
+# 4. 입력값(한국어/영어/숫자) -> 도감 ID 변환
 # ==========================================
 def resolve_pokemon_id(query):
     query = query.strip().lower()
 
-    # 1) 숫자인 경우
     if query.isdigit():
         return query
 
-    # 2) 한국어 사전에 있는 경우
     if query in POKEMON_KO_TO_ID:
-        return str(POKEMON_KO_TO_ID[query])
+        return POKEMON_KO_TO_ID[query]
 
-    # 3) 영어 이름인 경우 직접 호출 시도
     species_url = f'https://pokeapi.co/api/v2/pokemon-species/{query}'
     res = requests.get(species_url)
     if res.status_code == 200:
@@ -70,7 +97,7 @@ def resolve_pokemon_id(query):
     return None
 
 # ==========================================
-# 4. 포켓몬 정보 조회 및 Embed 생성
+# 5. 포켓몬 정보 조회 및 Embed 생성
 # ==========================================
 def get_pokemon_embed(pokemon_id_or_name):
     pokemon_id = resolve_pokemon_id(str(pokemon_id_or_name))
@@ -84,14 +111,12 @@ def get_pokemon_embed(pokemon_id_or_name):
 
     species_data = species_res.json()
 
-    # 한국어 공식 이름 추출
     display_name = str(pokemon_id)
     for name_entry in species_data['names']:
         if name_entry['language']['name'] == 'ko':
             display_name = name_entry['name']
             break
 
-    # 상세 정보 가져오기 (타입, 이미지 등)
     detail_url = f'https://pokeapi.co/api/v2/pokemon/{pokemon_id}'
     detail_res = requests.get(detail_url)
     if detail_res.status_code != 200:
@@ -118,7 +143,7 @@ def get_pokemon_embed(pokemon_id_or_name):
     return embed, species_data
 
 # ==========================================
-# 5. 진화 / 메가진화 버튼 View 클래스
+# 6. 진화 / 메가진화 버튼 View 클래스
 # ==========================================
 class PokemonEvolutionView(discord.ui.View):
     def __init__(self, species_data, current_pokemon_name):
@@ -184,31 +209,11 @@ class PokemonEvolutionView(discord.ui.View):
             await interaction.followup.send("진화 정보를 불러올 수 없습니다.", ephemeral=True)
 
 # ==========================================
-# 6. 디스코드 이벤트 핸들러 및 사전 자동 구축
+# 7. 디스코드 이벤트 핸들러 및 실행
 # ==========================================
 @client.event
 async def on_ready():
-    print('🔄 모든 포켓몬의 한국어 도감 데이터를 수집 중입니다. 잠시만 기다려주세요...')
-    
-    # PokeAPI에서 제공하는 1000여 개 포켓몬의 한국어 이름을 부팅 시 사전으로 수집
-    try:
-        res = requests.get('https://pokeapi.co/api/v2/pokemon-species?limit=1025')
-        if res.status_code == 200:
-            results = res.json()['results']
-            for item in results:
-                p_id = item['url'].split('/')[-2]
-                # 각 포켓몬의 species 정보에서 한국어 이름 추출
-                detail_res = requests.get(item['url'])
-                if detail_res.status_code == 200:
-                    names = detail_res.json().get('names', [])
-                    for n in names:
-                        if n['language']['name'] == 'ko':
-                            POKEMON_KO_TO_ID[n['name'].lower()] = p_id
-                            break
-        print(f"✅ 총 {len(POKEMON_KO_TO_ID)}마리 포켓몬의 한국어 이름 등록이 완료되었습니다!")
-    except Exception as e:
-        print(f"⚠️ 캐싱 중 오류 발생: {e}")
-
+    await build_korean_cache()
     print('🚀 포켓몬 봇이 완벽하게 가동되었습니다!')
 
 @client.event
@@ -220,7 +225,7 @@ async def on_message(message):
     if message.content == '!도감':
         embed = discord.Embed(
             title="📖 포켓몬 도감 사용법",
-            description="`!도감 [포켓몬 이름 또는 번호]` 형식으로 입력해 주세요!\n\n**예시:**\n• `!도감 피카츄` / `!도감 페로코체` / `!도감 나오하` (전 세대 한국어 검색)\n• `!도감 6` (도감 번호 검색)",
+            description="`!도감 [포켓몬 이름 또는 번호]` 형식으로 입력해 주세요!\n\n**예시:**\n• `!도감 리자몽` / `!도감 페로코체` / `!도감 나오하` (전 세대 한국어 검색)\n• `!도감 6` (도감 번호 검색)",
             color=0x3498db
         )
         await message.channel.send(embed=embed)
