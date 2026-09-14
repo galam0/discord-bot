@@ -62,6 +62,7 @@ EGG_GROUP_KO = {
     'bug': '벌레',
     'flying': '비행',
     'field': '육상',
+    'ground': '육상',
     'fairy': '요정',
     'grass': '식물',
     'human-like': '인간형',
@@ -152,95 +153,249 @@ async def get_pokemon_extra_info(data, species_data):
     return ability_text, egg_group_text, hatch_text, catch_text
 
 # ==========================================
-# 3. 픽셀몬 위키 스폰 바이옴 최종 정밀 추출 함수
+# 3. 픽셀몬 위키 스폰 바이옴/시간 추출
 # ==========================================
+PIXELMON_SPAWN_CACHE = {}
+
+PIXELMON_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/120.0.0.0 Safari/537.36"
+    )
+}
+
+TIME_ORDER = [
+    "Dawn", "Morning", "Day", "Midday", "Afternoon",
+    "Dusk", "Night", "Midnight", "Any"
+]
+
+
+def normalize_wiki_name(name):
+    """위키에서 비교하기 쉽도록 이름을 정규화합니다."""
+    return re.sub(r"[^a-z0-9]+", " ", name.lower()).strip()
+
+
+def clean_biome_text(text):
+    """바이옴 셀의 불필요한 표기만 정리합니다."""
+    if not text:
+        return ""
+
+    text = re.sub(r"\s+", " ", text).strip()
+
+    # Pixelmon 위키의 Forge 표기를 깔끔하게 표시
+    text = re.sub(r"\s*\(Forge\)", "", text, flags=re.IGNORECASE)
+
+    if text.lower() == "birches":
+        text = "Birch Forest"
+
+    return text
+
+
+def extract_times(text):
+    """시간 셀에서 Pixelmon 출몰 시간을 안정적으로 추출합니다."""
+    found = []
+    text = text or ""
+
+    for tk in TIME_ORDER:
+        if re.search(rf"\b{re.escape(tk)}\b", text, re.IGNORECASE):
+            found.append(tk)
+
+    # 표에서 '-' / 빈 값은 특정 시간이 아니라 Any로 취급
+    if not found and text.strip() in {"", "-", "—", "–"}:
+        return []
+
+    return found
+
+
+def parse_normal_spawn_table(soup):
+    """
+    일반 포켓몬 페이지의 'Spawn Biomes' 표만 정확하게 읽습니다.
+
+    현재 Pixelmon 위키 구조:
+        Biome | ModID | Time | Location | Condition | Rarity
+
+    예전 코드처럼 모든 표를 훑고 열 번호를 추측하지 않습니다.
+    그렇게 하면 Drops/Stats/Move 등의 표에서 엉뚱한 문자열이
+    바이옴으로 들어가는 문제가 생깁니다.
+    """
+    biomes = set()
+    times = set()
+
+    heading = None
+    for tag in soup.find_all(["h2", "h3"]):
+        heading_text = tag.get_text(" ", strip=True).lower()
+        if "spawn biomes" in heading_text:
+            heading = tag
+            break
+
+    if not heading:
+        return biomes, times
+
+    table = heading.find_next("table")
+    if not table:
+        return biomes, times
+
+    for row in table.find_all("tr"):
+        cells = row.find_all(["th", "td"], recursive=False)
+        if len(cells) < 3:
+            continue
+
+        values = [cell.get_text(" ", strip=True) for cell in cells]
+
+        # 헤더
+        if values[0].strip().lower() == "biome":
+            continue
+
+        biome = clean_biome_text(values[0])
+        time_text = values[2] if len(values) > 2 else ""
+
+        if biome:
+            biomes.add(biome)
+
+        times.update(extract_times(time_text))
+
+    return biomes, times
+
+
+async def parse_legendary_spawn_table(session, english_name):
+    """
+    전설/환상 포켓몬은 개별 포켓몬 페이지에 Spawn Biomes 표가 없고
+    Legendary_Pokemon 페이지의 Locations 표를 참조하므로 여기서 보완합니다.
+
+    표 구조:
+        Pokémon | Biomes | ModID | Time | Location | Condition | Rarity
+
+    같은 포켓몬의 바이옴이 여러 줄로 이어지는 경우도 처리합니다.
+    """
+    url = "https://pixelmonmod.com/wiki/Legendary_Pokemon"
+    target = normalize_wiki_name(english_name)
+
+    try:
+        async with session.get(url, headers=PIXELMON_HEADERS, timeout=12) as response:
+            if response.status != 200:
+                return set(), set()
+
+            html = await response.text()
+            soup = BeautifulSoup(html, "html.parser")
+
+            biomes = set()
+            times = set()
+            matched = False
+
+            for table in soup.find_all("table"):
+                rows = table.find_all("tr")
+                if not rows:
+                    continue
+
+                active_match = False
+
+                for row in rows:
+                    cells = row.find_all(["th", "td"], recursive=False)
+                    if len(cells) < 4:
+                        continue
+
+                    values = [cell.get_text(" ", strip=True) for cell in cells]
+                    first = normalize_wiki_name(values[0])
+
+                    # 헤더
+                    if first in {"pokemon", "pokémon"}:
+                        active_match = False
+                        continue
+
+                    # 새 포켓몬 행이면 기존 continuation을 종료
+                    if first:
+                        active_match = (first == target)
+                        if active_match:
+                            matched = True
+
+                    if not active_match:
+                        continue
+
+                    # Pokémon | Biomes | ModID | Time | ...
+                    if len(values) > 1:
+                        biome = clean_biome_text(values[1])
+                        if biome:
+                            biomes.add(biome)
+
+                    if len(values) > 3:
+                        times.update(extract_times(values[3]))
+
+                if matched:
+                    # 같은 표에서 해당 포켓몬을 찾았으면 다른 세대 표는 볼 필요 없음
+                    break
+
+            return biomes, times
+
+    except Exception:
+        return set(), set()
+
+
 async def get_pixelmon_spawn_info(english_name):
+    """일반/전설/환상 포켓몬의 Pixelmon 출몰 바이옴과 시간을 반환합니다."""
+    cache_key = normalize_wiki_name(english_name)
+    if cache_key in PIXELMON_SPAWN_CACHE:
+        return PIXELMON_SPAWN_CACHE[cache_key]
+
+    # Pixelmon 위키의 문서명은 일반적으로 첫 글자만 대문자입니다.
     formatted_name = english_name.replace(" ", "_").capitalize()
     wiki_url = f"https://pixelmonmod.com/wiki/{formatted_name}"
 
-    headers = {
-        "User-Agent": (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/120.0.0.0 Safari/537.36"
-        )
-    }
-
     try:
         async with aiohttp.ClientSession() as session:
-            async with session.get(wiki_url, headers=headers, timeout=10) as response:
-                if response.status != 200:
-                    return "정보 없음", "Any"
+            biomes = set()
+            times = set()
 
-                html = await response.text()
-                soup = BeautifulSoup(html, "html.parser")
+            # --------------------------------------------------
+            # 1차: 개별 포켓몬 페이지의 Spawn Biomes 표
+            # --------------------------------------------------
+            async with session.get(
+                wiki_url,
+                headers=PIXELMON_HEADERS,
+                timeout=12
+            ) as response:
+                if response.status == 200:
+                    html = await response.text()
+                    soup = BeautifulSoup(html, "html.parser")
+                    biomes, times = parse_normal_spawn_table(soup)
 
-                biomes = set()
-                times = set()
-                time_order = ["Dawn", "Morning", "Day", "Midday", "Afternoon", "Dusk", "Night", "Midnight", "Any"]
+            # --------------------------------------------------
+            # 2차: 전설/환상 포켓몬
+            # 개별 페이지에는 Spawn rate만 있고 실제 위치 정보가
+            # Legendary Pokémon 페이지에 있는 경우가 있습니다.
+            # --------------------------------------------------
+            if not biomes:
+                legendary_biomes, legendary_times = await parse_legendary_spawn_table(
+                    session,
+                    english_name
+                )
+                biomes.update(legendary_biomes)
+                times.update(legendary_times)
 
-                tables = soup.find_all("table")
-                for table in tables:
-                    for row in table.find_all("tr"):
-                        cells = row.find_all(["th", "td"], recursive=False)
-                        
-                        # 스폰 정보 표는 일반적으로 최소 3~5개 이상의 열(셀)을 가집니다.
-                        if len(cells) >= 3:
-                            values = [cell.get_text(" ", strip=True) for cell in cells]
-                            all_text = " ".join(values).lower()
+            sorted_times = [t for t in TIME_ORDER if t in times]
 
-                            # 기술(Move), TM, 드랍, 능력치 등 불필요한 표 행은 철저히 무시
-                            if any(k in all_text for k in ["move", "tm/hm", "drop", "evolution", "stats", "abilities", "egg groups", "catch rate"]):
-                                continue
+            # 특정 시간이 표에 없으면 Any
+            time_text = ", ".join(sorted_times) if sorted_times else "Any"
 
-                            # 헤더 행 무시
-                            if "biome" in all_text and "modid" in all_text:
-                                continue
+            # 위키가 'Does Not Spawn'이라고 명시한 경우도 정보 없음으로 버리지 않음
+            if biomes:
+                sorted_biomes = sorted(biomes, key=str.lower)
+                biome_text = ", ".join(sorted_biomes)
+            else:
+                biome_text = "정보 없음"
 
-                            # 바이옴 후보 추출 (일반적으로 첫 번째 칸 또는 두 번째 칸에 위치)
-                            biome_candidate = ""
-                            time_candidate = ""
+            if len(biome_text) > 1000:
+                biome_text = biome_text[:997] + "..."
 
-                            if len(values) >= 6:
-                                # 전설/특수 페이지 표 구조 [이름, 바이옴, ModID, 시간, 위치, ...]
-                                biome_candidate = values[1]
-                                time_candidate = values[3]
-                            elif len(values) >= 3:
-                                # 일반 페이지 표 구조 [바이옴, ModID, 시간, ...]
-                                biome_candidate = values[0]
-                                time_candidate = values[2] if len(values) > 2 else ""
-
-                            # 추출된 텍스트가 마인크래프트 바이옴 형태인지 검증 (기술명이나 긴 설명글 배제)
-                            if biome_candidate and len(biome_candidate) < 25:
-                                low_b = biome_candidate.lower()
-                                if not any(bad in low_b for bad in ["voice", "endure", "ratio", "gender", "level", "wild", "tm", "tutor", "egg", "animated", "by", "attack", "defense"]):
-                                    cleaned_biome = biome_candidate
-                                    if cleaned_biome.lower() == "birches":
-                                        cleaned_biome = "Birch Forest"
-                                    elif " (forge)" in cleaned_biome.lower():
-                                        cleaned_biome = cleaned_biome.replace(" (Forge)", "").replace(" (forge)", "")
-                                    biomes.add(cleaned_biome)
-
-                            if time_candidate:
-                                for tk in time_order:
-                                    if re.search(rf"\b{re.escape(tk)}\b", time_candidate, re.IGNORECASE):
-                                        times.add(tk)
-
-                sorted_times = [t for t in time_order if t in times]
-                time_text = ", ".join(sorted_times) if sorted_times else "Any"
-
-                sorted_biomes = sorted(list(biomes), key=str.lower)
-                biome_text = ", ".join(sorted_biomes) if sorted_biomes else "정보 없음"
-
-                if len(biome_text) > 1000:
-                    biome_text = biome_text[:997] + "..."
-
-                return biome_text, time_text
+            result = (biome_text, time_text)
+            PIXELMON_SPAWN_CACHE[cache_key] = result
+            return result
 
     except Exception:
-        pass
+        result = ("정보 없음", "Any")
+        PIXELMON_SPAWN_CACHE[cache_key] = result
+        return result
 
-    return "정보 없음", "Any"
 # ==========================================
 # 4. 한국어 사전 구축 (aiohttp)
 # ==========================================
@@ -372,9 +527,23 @@ async def get_pokemon_embed_async(pokemon_id_or_name):
     biome_info, time_info = await get_pixelmon_spawn_info(english_name)
     ability_text, egg_group_text, hatch_text, catch_text = await get_pokemon_extra_info(data, species_data)
 
+    # 전설 / 환상 여부는 PokeAPI species 데이터의 공식 분류를 사용합니다.
+    # 지역 폼이나 다른 형태로 조회해도 species 데이터가 같다면 동일하게 표시됩니다.
+    rarity_badge = ""
+    rarity_color = 0xcc0000
+
+    if species_data.get("is_legendary", False):
+        rarity_badge = "🌟 전설"
+        rarity_color = 0xF1C40F
+    elif species_data.get("is_mythical", False):
+        rarity_badge = "✨ 환상"
+        rarity_color = 0x9B59B6
+
+    title_prefix = f"{rarity_badge} " if rarity_badge else ""
+
     embed = discord.Embed(
-        title=f"포켓몬 정보: {display_name}",
-        color=0xcc0000
+        title=f"{title_prefix}포켓몬 정보: {display_name}",
+        color=rarity_color
     )
     embed.set_thumbnail(url=image_url)
 
@@ -383,6 +552,10 @@ async def get_pokemon_embed_async(pokemon_id_or_name):
         value=f"No.{species_data['id']}",
         inline=False
     )
+
+    # 전설/환상 포켓몬만 별도의 등급 뱃지를 표시합니다.
+    if rarity_badge:
+        embed.add_field(name="🏷️ 등급", value=f"**{rarity_badge}**", inline=False)
 
     embed.add_field(name="⚔️ 타입", value=types_str, inline=True)
     embed.add_field(name="🛡️ 특성", value=ability_text, inline=True)
