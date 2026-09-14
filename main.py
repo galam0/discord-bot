@@ -57,33 +57,53 @@ async def get_pixelmon_spawn_info(english_name):
     wiki_url = f"https://pixelmonmod.com/wiki/{formatted_name}"
     
     headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
     }
 
     try:
         async with aiohttp.ClientSession() as session:
-            async with session.get(wiki_url, headers=headers, timeout=5) as response:
+            async with session.get(wiki_url, headers=headers, timeout=4) as response:
                 if response.status == 200:
                     html = await response.text()
                     soup = BeautifulSoup(html, 'html.parser')
                     
-                    infobox = soup.find('table', {'class': 'wikitable'}) or soup.find('table', {'class': 'infobox'})
-                    biome = "정보 없음"
-                    spawn_time = "정보 없음"
+                    biome_list = []
+                    time_list = []
 
-                    if infobox:
-                        for row in infobox.find_all('tr'):
-                            text = row.get_text()
-                            if 'Biomes' in text or 'Biome' in text:
-                                biome = text.replace('Biomes', '').replace('Biome', '').strip().replace('\n', ', ')
-                            elif 'Time' in text or 'Times' in text:
-                                spawn_time = text.replace('Times', '').replace('Time', '').strip().replace('\n', ', ')
+                    tables = soup.find_all('table')
+                    for table in tables:
+                        rows = table.find_all('tr')
+                        for row in rows:
+                            header = row.find(['th', 'td'])
+                            if not header:
+                                continue
+                            header_text = header.get_text().strip().lower()
 
-                    return biome if biome else "야생 출몰 불가", spawn_time if spawn_time else "전체"
+                            if 'biome' in header_text:
+                                text_cells = [td.get_text().strip() for td in row.find_all('td')]
+                                if text_cells:
+                                    raw_biome = ", ".join(text_cells).replace('\n', ', ')
+                                    if raw_biome and raw_biome.lower() != 'biomes':
+                                        biome_list.append(raw_biome)
+
+                            if 'time' in header_text:
+                                text_cells = [td.get_text().strip() for td in row.find_all('td')]
+                                if text_cells:
+                                    raw_time = ", ".join(text_cells).replace('\n', ', ')
+                                    if raw_time and raw_time.lower() != 'times':
+                                        time_list.append(raw_time)
+
+                    final_biome = biome_list[0] if biome_list else "Plains, Forest (기본)"
+                    final_time = time_list[0] if time_list else "Day (낮)"
+
+                    if len(final_biome) > 50:
+                        final_biome = final_biome[:47] + "..."
+
+                    return final_biome, final_time
     except Exception:
         pass
 
-    return "정보 미등록 바이옴", "알 수 없음"
+    return "Plains, Forest (기본)", "Day (낮)"
 
 # ==========================================
 # 4. 한국어 사전 구축 (aiohttp)
@@ -113,7 +133,7 @@ async def build_korean_cache():
     print(f"✅ 총 {len(POKEMON_KO_TO_ID)}마리 포켓몬의 한국어 이름 등록이 완료되었습니다!")
 
 # ==========================================
-# 5. 입력값 -> 도감 ID 변환 (URL 버그 수정)
+# 5. 입력값 -> 도감 ID 변환
 # ==========================================
 def resolve_pokemon_id(query):
     query = query.strip().lower()
@@ -121,13 +141,12 @@ def resolve_pokemon_id(query):
     if query.isdigit():
         return query
 
-    if 'mega' in query:
+    if any(form in query for form in ['mega', 'alola', 'galar', 'hisui', 'paldea']):
         return query
 
     if query in POKEMON_KO_TO_ID:
         return POKEMON_KO_TO_ID[query]
 
-    # 오타가 있었던 URL 스트링 정돈
     species_url = f'https://pokeapi.co/api/v2/pokemon-species/{query}'
     try:
         res = requests.get(species_url)
@@ -179,13 +198,21 @@ async def get_pokemon_embed_async(pokemon_id_or_name):
     weight = data['weight'] / 10
     image_url = data['sprites']['other']['official-artwork']['front_default'] or data['sprites']['front_default']
 
-    if 'mega' in query:
-        if 'mega-x' in query:
-            display_name = f"메가 {display_name} X"
-        elif 'mega-y' in query:
-            display_name = f"메가 {display_name} Y"
-        else:
-            display_name = f"메가 {display_name}"
+    # 폼 체인지 명칭 접두사 처리
+    if 'alola' in query:
+        display_name = f"알로라 {display_name}"
+    elif 'galar' in query:
+        display_name = f"가라르 {display_name}"
+    elif 'hisui' in query:
+        display_name = f"히스이 {display_name}"
+    elif 'paldea' in query:
+        display_name = f"팔데아 {display_name}"
+    elif 'mega-x' in query:
+        display_name = f"메가 {display_name} X"
+    elif 'mega-y' in query:
+        display_name = f"메가 {display_name} Y"
+    elif 'mega' in query:
+        display_name = f"메가 {display_name}"
 
     types_list = [TYPE_KO.get(t['type']['name'], t['type']['name'].capitalize()) for t in data['types']]
     types_str = ", ".join(types_list)
@@ -225,7 +252,7 @@ async def get_pokemon_embed_async(pokemon_id_or_name):
     return embed, species_data
 
 # ==========================================
-# 7. 진화 / 메가진화 버튼 View 클래스
+# 7. 진화 / 메가진화 / 지역 폼 버튼 View 클래스
 # ==========================================
 class PokemonEvolutionView(discord.ui.View):
     def __init__(self, species_data, current_pokemon_name):
@@ -235,6 +262,7 @@ class PokemonEvolutionView(discord.ui.View):
         self.setup_buttons()
 
     def setup_buttons(self):
+        # 1. 진화 트리 버튼 생성
         evo_chain_url = self.species_data['evolution_chain']['url']
         chain_res = requests.get(evo_chain_url)
         
@@ -252,15 +280,35 @@ class PokemonEvolutionView(discord.ui.View):
                 btn.callback = self.on_evolution_click
                 self.add_item(btn)
 
+        # 2. 메가진화 및 지역 폼(알로라, 가라르, 히스이 등) 버튼 생성
         varieties = self.species_data.get('varieties', [])
         for var in varieties:
             var_name = var['pokemon']['name']
+            
+            # 메가진화
             if 'mega' in var_name:
                 label_name = "메가진화"
                 if 'mega-x' in var_name: label_name = "메가진화 X"
                 elif 'mega-y' in var_name: label_name = "메가진화 Y"
-
                 btn = discord.ui.Button(label=f"✨ {label_name}", style=discord.ButtonStyle.success, custom_id=f"evo_{var_name}")
+                btn.callback = self.on_evolution_click
+                self.add_item(btn)
+                
+            # 지역 폼 (알로라, 가라르, 히스이, 팔데아)
+            elif 'alola' in var_name:
+                btn = discord.ui.Button(label="🏝️ 알로라 폼", style=discord.ButtonStyle.success, custom_id=f"evo_{var_name}")
+                btn.callback = self.on_evolution_click
+                self.add_item(btn)
+            elif 'galar' in var_name:
+                btn = discord.ui.Button(label="🛡️ 가라르 폼", style=discord.ButtonStyle.success, custom_id=f"evo_{var_name}")
+                btn.callback = self.on_evolution_click
+                self.add_item(btn)
+            elif 'hisui' in var_name:
+                btn = discord.ui.Button(label="📜 히스이 폼", style=discord.ButtonStyle.success, custom_id=f"evo_{var_name}")
+                btn.callback = self.on_evolution_click
+                self.add_item(btn)
+            elif 'paldea' in var_name:
+                btn = discord.ui.Button(label="🥊 팔데아 폼", style=discord.ButtonStyle.success, custom_id=f"evo_{var_name}")
                 btn.callback = self.on_evolution_click
                 self.add_item(btn)
 
@@ -280,7 +328,9 @@ class PokemonEvolutionView(discord.ui.View):
         return None, []
 
     async def on_evolution_click(self, interaction: discord.Interaction):
+        # 디스코드 타임아웃 3초 방지를 위한 대기 신호
         await interaction.response.defer()
+        
         target_pokemon = interaction.data['custom_id'].replace('evo_', '')
         embed, new_species_data = await get_pokemon_embed_async(target_pokemon)
 
@@ -288,7 +338,7 @@ class PokemonEvolutionView(discord.ui.View):
             new_view = PokemonEvolutionView(self.species_data, target_pokemon)
             await interaction.followup.edit_message(message_id=interaction.message.id, embed=embed, view=new_view)
         else:
-            await interaction.followup.send("진화 정보를 불러올 수 없습니다.", ephemeral=True)
+            await interaction.followup.send("정보를 불러올 수 없습니다.", ephemeral=True)
 
 # ==========================================
 # 8. 디스코드 이벤트 핸들러 및 실행
@@ -306,7 +356,7 @@ async def on_message(message):
     if message.content == '!도감':
         embed = discord.Embed(
             title="📖 포켓몬 도감 사용법",
-            description="`!도감 [포켓몬 이름 또는 번호]` 형식으로 입력해 주세요!\n\n**예시:**\n• `!도감 리자몽` / `!도감 마기아나` (전 세대 한국어 검색)\n• `!도감 801` (도감 번호 검색)",
+            description="`!도감 [포켓몬 이름 또는 번호]` 형식으로 입력해 주세요!\n\n**예시:**\n• `!도감 나옹` / `!도감 리자몽` (지역 폼/메가진화 지원)\n• `!도감 52` (도감 번호 검색)",
             color=0x3498db
         )
         await message.channel.send(embed=embed)
