@@ -542,7 +542,7 @@ async def get_pokemon_embed_async(pokemon_id_or_name):
     return embed, species_data
 
 # ==========================================
-# 7. 진화 / 메가진화 / 지역폼 / 원래형태 버튼 View 클래스
+# 7. 진화 / 메가진화 / 지역폼 / 원래형태 버튼 View 클래스 (중복 ID 버그 수정 완료)
 # ==========================================
 class PokemonEvolutionView(discord.ui.View):
     def __init__(self, species_data, current_pokemon_name, base_species_name=None):
@@ -553,11 +553,18 @@ class PokemonEvolutionView(discord.ui.View):
         self.setup_buttons()
 
     def setup_buttons(self):
-        if self.current_name != self.base_species_name:
-            btn = discord.ui.Button(label="🔄 원래 형태", style=discord.ButtonStyle.secondary, custom_id=f"evo_{self.base_species_name}")
-            btn.callback = self.on_evolution_click
-            self.add_item(btn)
+        added_custom_ids = set()
 
+        # 1. 원래 형태 돌아가기 버튼 (현재 폼이 기본 species와 다를 때만)
+        if self.current_name != self.base_species_name:
+            cid = f"evo_{self.base_species_name}"
+            if cid not in added_custom_ids:
+                btn = discord.ui.Button(label="🔄 원래 형태", style=discord.ButtonStyle.secondary, custom_id=cid)
+                btn.callback = self.on_evolution_click
+                self.add_item(btn)
+                added_custom_ids.add(cid)
+
+        # 2. 이전/다음 진화 버튼 생성
         evo_chain_url = self.species_data['evolution_chain']['url']
         chain_res = requests.get(evo_chain_url)
         
@@ -566,46 +573,62 @@ class PokemonEvolutionView(discord.ui.View):
             prev_evo, next_evos = self.find_evolutions(chain_data, self.species_data['name'])
 
             if prev_evo and prev_evo != self.current_name:
-                btn = discord.ui.Button(label="이전 진화", style=discord.ButtonStyle.secondary, custom_id=f"evo_{prev_evo}")
-                btn.callback = self.on_evolution_click
-                self.add_item(btn)
+                cid = f"evo_{prev_evo}"
+                if cid not in added_custom_ids:
+                    btn = discord.ui.Button(label="이전 진화", style=discord.ButtonStyle.secondary, custom_id=cid)
+                    btn.callback = self.on_evolution_click
+                    self.add_item(btn)
+                    added_custom_ids.add(cid)
 
             for next_evo in next_evos:
                 if next_evo != self.current_name:
-                    btn = discord.ui.Button(label=f"진화 ({next_evo.capitalize()})", style=discord.ButtonStyle.primary, custom_id=f"evo_{next_evo}")
-                    btn.callback = self.on_evolution_click
-                    self.add_item(btn)
+                    cid = f"evo_{next_evo}"
+                    if cid not in added_custom_ids:
+                        btn = discord.ui.Button(label=f"진화 ({next_evo.capitalize()})", style=discord.ButtonStyle.primary, custom_id=cid)
+                        btn.callback = self.on_evolution_click
+                        self.add_item(btn)
+                        added_custom_ids.add(cid)
 
+        # 3. 폼 체인지 / 메가진화 버튼 생성
         varieties = self.species_data.get('varieties', [])
         for var in varieties:
             var_name = var['pokemon']['name']
             if var_name == self.current_name:
                 continue
 
+            cid = f"evo_{var_name}"
+            if cid in added_custom_ids:
+                continue
+
             if 'mega' in var_name:
                 label_name = "메가진화"
                 if 'mega-x' in var_name: label_name = "메가진화 X"
                 elif 'mega-y' in var_name: label_name = "메가진화 Y"
-                btn = discord.ui.Button(label=f"✨ {label_name}", style=discord.ButtonStyle.success, custom_id=f"evo_{var_name}")
+                btn = discord.ui.Button(label=f"✨ {label_name}", style=discord.ButtonStyle.success, custom_id=cid)
                 btn.callback = self.on_evolution_click
                 self.add_item(btn)
+                added_custom_ids.add(cid)
                 
             elif 'alola' in var_name:
-                btn = discord.ui.Button(label="🏝️ 알로라 폼", style=discord.ButtonStyle.success, custom_id=f"evo_{var_name}")
+                btn = discord.ui.Button(label="🏝️ 알로라 폼", style=discord.ButtonStyle.success, custom_id=cid)
                 btn.callback = self.on_evolution_click
                 self.add_item(btn)
+                added_custom_ids.add(cid)
             elif 'galar' in var_name:
-                btn = discord.ui.Button(label="🛡️ 가라르 폼", style=discord.ButtonStyle.success, custom_id=f"evo_{var_name}")
+                btn = discord.ui.Button(label="🛡️ 가라르 폼", style=discord.ButtonStyle.success, custom_id=cid)
                 btn.callback = self.on_evolution_click
                 self.add_item(btn)
+                added_custom_ids.add(cid)
             elif 'hisui' in var_name:
-                btn = discord.ui.Button(label="📜 히스이 폼", style=discord.ButtonStyle.success, custom_id=f"evo_{var_name}")
+                btn = discord.ui.Button(label="📜 히스이 폼", style=discord.ButtonStyle.success, custom_id=cid)
                 btn.callback = self.on_evolution_click
                 self.add_item(btn)
+                added_custom_ids.add(cid)
             elif 'paldea' in var_name:
-                btn = discord.ui.Button(label="🥊 팔데아 폼", style=discord.ButtonStyle.success, custom_id=f"evo_{var_name}")
+                btn = discord.ui.Button(label="🥊 팔데아 폼", style=discord.ButtonStyle.success, custom_id=cid)
                 btn.callback = self.on_evolution_click
                 self.add_item(btn)
+                added_custom_ids.add(cid)
 
     def find_evolutions(self, chain_node, target_name):
         if chain_node['species']['name'] == target_name:
