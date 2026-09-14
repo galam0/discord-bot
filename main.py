@@ -152,11 +152,14 @@ async def get_pokemon_extra_info(data, species_data):
     return ability_text, egg_group_text, hatch_text, catch_text
 
 # ==========================================
-# 3. 픽셀몬 위키 바이옴 전용 정밀 추출 함수
+# 3. 픽셀몬 위키 일반 + 전설 통합 스폰 정밀 추출 함수
 # ==========================================
 async def get_pixelmon_spawn_info(english_name):
     formatted_name = english_name.replace(" ", "_").capitalize()
-    wiki_url = f"https://pixelmonmod.com/wiki/{formatted_name}"
+    wiki_urls = [
+        f"https://pixelmonmod.com/wiki/{formatted_name}",
+        "https://pixelmonmod.com/wiki/Legendary_Pokemon"  # 전설/환상 통합 위키 백업 링크
+    ]
 
     headers = {
         "User-Agent": (
@@ -166,74 +169,78 @@ async def get_pixelmon_spawn_info(english_name):
         )
     }
 
+    time_keywords = ["밤", "낮", "Night", "Day", "Dawn", "Dusk", "Any", "Morning", "Afternoon"]
+
     try:
         async with aiohttp.ClientSession() as session:
-            async with session.get(
-                wiki_url,
-                headers=headers,
-                timeout=10
-            ) as response:
+            biomes = set()
+            times = set()
 
-                if response.status != 200:
-                    return "정보 없음", "Any"
+            for wiki_url in wiki_urls:
+                async with session.get(wiki_url, headers=headers, timeout=10) as response:
+                    if response.status != 200:
+                        continue
 
-                html = await response.text()
-                soup = BeautifulSoup(html, "html.parser")
+                    html = await response.text()
+                    soup = BeautifulSoup(html, "html.parser")
+                    tables = soup.find_all("table")
 
-                biomes = set()
-                # 기존에 잘 작동하던 시간 파싱 결과 변수를 그대로 가져오기 위해 시간 셀 수집용 임시 세트
-                times = set()
-                time_order = ["Dawn", "Morning", "Day", "Midday", "Afternoon", "Dusk", "Night", "Midnight", "Any"]
+                    for table in tables:
+                        for row in table.find_all("tr"):
+                            cells = row.find_all(["th", "td"], recursive=False)
+                            if len(cells) >= 2:
+                                row_text = row.get_text(" ", strip=True)
+                                
+                                # 통합 전설 페이지인 경우, 해당 포켓몬 이름이 행에 포함되어 있는지 확인
+                                if "Legendary_Pokemon" in wiki_url and formatted_name.lower() not in row_text.lower():
+                                    continue
 
-                tables = soup.find_all("table")
-                for table in tables:
-                    for row in table.find_all("tr"):
-                        cells = row.find_all(["th", "td"], recursive=False)
-                        
-                        if len(cells) >= 4:
-                            values = [cell.get_text(" ", strip=True) for cell in cells]
-                            all_text = " ".join(values).lower()
+                                values = [cell.get_text(" ", strip=True) for cell in cells]
+                                all_text = " ".join(values).lower()
 
-                            if "biome" in all_text or "modid" in all_text or "포켓몬" in all_text:
-                                continue
+                                if "biome" in all_text or "modid" in all_text or "포켓몬" in all_text:
+                                    continue
 
-                            # 전설 및 일반 페이지 표 구조에 따른 바이옴 셀 분기 처리
-                            if len(cells) >= 5 and not cells[0].get_text(strip=True).lower() in ["plains", "forest", "dark forest", "desert", "jungle", "taiga", "beach", "mountain", "savanna", "swamp", "ocean", "river", "roofed forest"]:
-                                biome_candidate = values[1] # 전설 페이지 형태 (1번 인덱스가 바이옴)
-                                time_candidate = values[3] if len(values) > 3 else ""
-                            else:
-                                biome_candidate = values[0] # 일반 페이지 형태 (0번 인덱스가 바이옴)
-                                time_candidate = values[2] if len(values) > 2 else ""
+                                # 텍스트 구조에 따른 바이옴 추출 후보 선택
+                                if len(cells) >= 5 and not cells[0].get_text(strip=True).lower() in ["plains", "forest", "dark forest", "desert", "jungle", "taiga", "beach", "mountain", "savanna", "swamp", "ocean", "river", "roofed forest"]:
+                                    biome_candidate = values[1] if len(values) > 1 else ""
+                                    time_candidate = values[3] if len(values) > 3 else ""
+                                else:
+                                    biome_candidate = values[0] if len(values) > 0 else ""
+                                    time_candidate = values[2] if len(values) > 2 else ""
 
-                            if biome_candidate and len(biome_candidate) < 30 and not any(k in biome_candidate.lower() for k in ["move", "drop", "egg", "ratio", "land", "air"]):
-                                cleaned_biome = biome_candidate
-                                if cleaned_biome.lower() == "birches":
-                                    cleaned_biome = "Birch Forest"
-                                elif " (forge)" in cleaned_biome.lower():
-                                    cleaned_biome = cleaned_biome.replace(" (Forge)", "").replace(" (forge)", "")
-                                biomes.add(cleaned_biome)
+                                if biome_candidate and len(biome_candidate) < 30 and not any(k in biome_candidate.lower() for k in ["move", "drop", "egg", "ratio", "land", "air"]):
+                                    cleaned_biome = biome_candidate
+                                    if cleaned_biome.lower() == "birches":
+                                        cleaned_biome = "Birch Forest"
+                                    elif " (forge)" in cleaned_biome.lower():
+                                        cleaned_biome = cleaned_biome.replace(" (Forge)", "").replace(" (forge)", "")
+                                    biomes.add(cleaned_biome)
 
-                            if time_candidate:
-                                for tk in time_order:
-                                    if re.search(rf"\b{re.escape(tk)}\b", time_candidate, re.IGNORECASE):
-                                        times.add(tk)
+                                if time_candidate:
+                                    for tk in time_keywords:
+                                        if tk.lower() in time_candidate.lower():
+                                            times.add(time_candidate)
 
-                # 시간 정보는 기존에 잘 출력되던 방식을 유지
-                sorted_times = [t for t in time_order if t in times]
-                time_text = ", ".join(sorted_times) if sorted_times else "Night"
+                # 개별 페이지에서 바이옴을 찾았다면 전설 통합 페이지까지 갈 필요 없이 즉시 탈출
+                if biomes:
+                    break
 
-                sorted_biomes = sorted(list(biomes), key=str.lower)
-                biome_text = ", ".join(sorted_biomes) if sorted_biomes else "Dark Forest"
+            sorted_times = sorted(list(times))
+            time_text = ", ".join(sorted_times) if sorted_times else "Any"
 
-                if len(biome_text) > 1000:
-                    biome_text = biome_text[:997] + "..."
+            sorted_biomes = sorted(list(biomes), key=str.lower)
+            biome_text = ", ".join(sorted_biomes) if sorted_biomes else "정보 없음"
 
-                return biome_text, time_text
+            if len(biome_text) > 1000:
+                biome_text = biome_text[:997] + "..."
+
+            return biome_text, time_text
 
     except Exception:
         pass
 
-    return "Dark Forest", "Night"
+    return "정보 없음", "Any"
 # ==========================================
 # 4. 한국어 사전 구축 (aiohttp)
 # ==========================================
