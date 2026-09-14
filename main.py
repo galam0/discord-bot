@@ -3,6 +3,7 @@ import os
 import requests
 import aiohttp
 import asyncio
+from bs4 import BeautifulSoup
 from pymongo import MongoClient
 from flask import Flask
 from threading import Thread
@@ -37,7 +38,6 @@ mongo_client = MongoClient(mongo_uri)
 db = mongo_client['pokemon_game']
 collection = db['users']
 
-# 전 포켓몬 한국어 이름 ↔ ID 캐시 사전
 POKEMON_KO_TO_ID = {}
 
 TYPE_KO = {
@@ -50,7 +50,43 @@ TYPE_KO = {
 }
 
 # ==========================================
-# 3. 비동기 포켓몬 한국어 사전 초속 구축 (aiohttp)
+# 3. 픽셀몬 위키 실시간 웹 스크래핑 함수
+# ==========================================
+async def get_pixelmon_spawn_info(english_name):
+    formatted_name = english_name.capitalize()
+    wiki_url = f"https://pixelmonmod.com/wiki/{formatted_name}"
+    
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+    }
+
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(wiki_url, headers=headers, timeout=5) as response:
+                if response.status == 200:
+                    html = await response.text()
+                    soup = BeautifulSoup(html, 'html.parser')
+                    
+                    infobox = soup.find('table', {'class': 'wikitable'}) or soup.find('table', {'class': 'infobox'})
+                    biome = "정보 없음"
+                    spawn_time = "정보 없음"
+
+                    if infobox:
+                        for row in infobox.find_all('tr'):
+                            text = row.get_text()
+                            if 'Biomes' in text or 'Biome' in text:
+                                biome = text.replace('Biomes', '').replace('Biome', '').strip().replace('\n', ', ')
+                            elif 'Time' in text or 'Times' in text:
+                                spawn_time = text.replace('Times', '').replace('Time', '').strip().replace('\n', ', ')
+
+                    return biome if biome else "야생 출몰 불가", spawn_time if spawn_time else "전체"
+    except Exception:
+        pass
+
+    return "정보 미등록 바이옴", "알 수 없음"
+
+# ==========================================
+# 4. 한국어 사전 구축 (aiohttp)
 # ==========================================
 async def fetch_species_name(session, item):
     try:
@@ -68,7 +104,7 @@ async def fetch_species_name(session, item):
 async def build_korean_cache():
     print('🔄 비동기로 전체 포켓몬 한국어 데이터베이스를 수집 중입니다...')
     async with aiohttp.ClientSession() as session:
-        async with session.get('[https://pokeapi.co/api/v2/pokemon-species?limit=1025](https://pokeapi.co/api/v2/pokemon-species?limit=1025)') as response:
+        async with session.get('https://pokeapi.co/api/v2/pokemon-species?limit=1025') as response:
             if response.status == 200:
                 data = await response.json()
                 results = data['results']
@@ -77,7 +113,7 @@ async def build_korean_cache():
     print(f"✅ 총 {len(POKEMON_KO_TO_ID)}마리 포켓몬의 한국어 이름 등록이 완료되었습니다!")
 
 # ==========================================
-# 4. 입력값(한국어/영어/숫자/메가진화) -> ID 변환
+# 5. 입력값 -> 도감 ID 변환 (URL 버그 수정)
 # ==========================================
 def resolve_pokemon_id(query):
     query = query.strip().lower()
@@ -91,17 +127,21 @@ def resolve_pokemon_id(query):
     if query in POKEMON_KO_TO_ID:
         return POKEMON_KO_TO_ID[query]
 
-    species_url = f'[https://pokeapi.co/api/v2/pokemon-species/](https://pokeapi.co/api/v2/pokemon-species/){query}'
-    res = requests.get(species_url)
-    if res.status_code == 200:
-        return str(res.json()['id'])
+    # 오타가 있었던 URL 스트링 정돈
+    species_url = f'https://pokeapi.co/api/v2/pokemon-species/{query}'
+    try:
+        res = requests.get(species_url)
+        if res.status_code == 200:
+            return str(res.json()['id'])
+    except Exception:
+        pass
 
     return None
 
 # ==========================================
-# 5. 포켓몬 정보 조회 및 Embed 생성 (종족치 포함)
+# 6. 포켓몬 정보 및 스크래핑 통합 Embed 생성
 # ==========================================
-def get_pokemon_embed(pokemon_id_or_name):
+async def get_pokemon_embed_async(pokemon_id_or_name):
     query = str(pokemon_id_or_name).strip().lower()
     pokemon_id = resolve_pokemon_id(query)
     
@@ -109,13 +149,14 @@ def get_pokemon_embed(pokemon_id_or_name):
         return None, None
 
     species_name = query.split('-')[0] if '-' in query else pokemon_id
-    species_url = f'[https://pokeapi.co/api/v2/pokemon-species/](https://pokeapi.co/api/v2/pokemon-species/){species_name}'
+    species_url = f'https://pokeapi.co/api/v2/pokemon-species/{species_name}'
     species_res = requests.get(species_url)
     
     if species_res.status_code != 200:
         return None, None
 
     species_data = species_res.json()
+    english_name = species_data['name']
 
     display_name = str(species_data['id'])
     for name_entry in species_data['names']:
@@ -123,11 +164,11 @@ def get_pokemon_embed(pokemon_id_or_name):
             display_name = name_entry['name']
             break
 
-    detail_url = f'[https://pokeapi.co/api/v2/pokemon/](https://pokeapi.co/api/v2/pokemon/){query}'
+    detail_url = f'https://pokeapi.co/api/v2/pokemon/{query}'
     detail_res = requests.get(detail_url)
     
     if detail_res.status_code != 200:
-        detail_url = f'[https://pokeapi.co/api/v2/pokemon/](https://pokeapi.co/api/v2/pokemon/){pokemon_id}'
+        detail_url = f'https://pokeapi.co/api/v2/pokemon/{pokemon_id}'
         detail_res = requests.get(detail_url)
 
     if detail_res.status_code != 200:
@@ -149,7 +190,7 @@ def get_pokemon_embed(pokemon_id_or_name):
     types_list = [TYPE_KO.get(t['type']['name'], t['type']['name'].capitalize()) for t in data['types']]
     types_str = ", ".join(types_list)
 
-    # 종족값 파싱 (HP, Atk, Def, SpA, SpD, Spe)
+    # 종족치 파싱
     stats = {stat['stat']['name']: stat['base_stat'] for stat in data['stats']}
     hp = stats.get('hp', 0)
     atk = stats.get('attack', 0)
@@ -159,7 +200,6 @@ def get_pokemon_embed(pokemon_id_or_name):
     spe = stats.get('speed', 0)
     total = hp + atk + dfe + spa + spd + spe
 
-    # 이미지 속 표 형식 텍스트 생성
     stats_table = (
         "```text\n"
         "+-----------------------------------+\n"
@@ -170,18 +210,22 @@ def get_pokemon_embed(pokemon_id_or_name):
         "```"
     )
 
+    biome_info, time_info = await get_pixelmon_spawn_info(english_name)
+
     embed = discord.Embed(title=f"포켓몬 정보: {display_name}", color=0xcc0000)
     embed.set_thumbnail(url=image_url)
     embed.add_field(name="도감 번호", value=f"No.{species_data['id']}", inline=False)
     embed.add_field(name="타입", value=types_str, inline=False)
     embed.add_field(name="키", value=f"{height}m", inline=True)
     embed.add_field(name="몸무게", value=f"{weight}kg", inline=True)
+    embed.add_field(name="⏳ 출몰 시간", value=time_info, inline=True)
+    embed.add_field(name="🍄 출몰 바이옴", value=biome_info, inline=True)
     embed.add_field(name="🌸 종족치", value=stats_table, inline=False)
 
     return embed, species_data
 
 # ==========================================
-# 6. 진화 / 메가진화 버튼 View 클래스
+# 7. 진화 / 메가진화 버튼 View 클래스
 # ==========================================
 class PokemonEvolutionView(discord.ui.View):
     def __init__(self, species_data, current_pokemon_name):
@@ -238,7 +282,7 @@ class PokemonEvolutionView(discord.ui.View):
     async def on_evolution_click(self, interaction: discord.Interaction):
         await interaction.response.defer()
         target_pokemon = interaction.data['custom_id'].replace('evo_', '')
-        embed, new_species_data = get_pokemon_embed(target_pokemon)
+        embed, new_species_data = await get_pokemon_embed_async(target_pokemon)
 
         if embed:
             new_view = PokemonEvolutionView(self.species_data, target_pokemon)
@@ -247,7 +291,7 @@ class PokemonEvolutionView(discord.ui.View):
             await interaction.followup.send("진화 정보를 불러올 수 없습니다.", ephemeral=True)
 
 # ==========================================
-# 7. 디스코드 이벤트 핸들러 및 실행
+# 8. 디스코드 이벤트 핸들러 및 실행
 # ==========================================
 @client.event
 async def on_ready():
@@ -269,7 +313,7 @@ async def on_message(message):
 
     elif message.content.startswith('!도감 '):
         query = message.content.split(' ')[1].strip()
-        embed, species_data = get_pokemon_embed(query)
+        embed, species_data = await get_pokemon_embed_async(query)
 
         if embed and species_data:
             view = PokemonEvolutionView(species_data, species_data['name'])
@@ -279,7 +323,7 @@ async def on_message(message):
 
     elif message.content.startswith('!포획 '):
         query = message.content.split(' ')[1].strip()
-        embed, species_data = get_pokemon_embed(query)
+        embed, species_data = await get_pokemon_embed_async(query)
 
         if species_data:
             pokemon_name = str(species_data['id'])
