@@ -241,4 +241,205 @@ async def get_pokemon_embed_async(pokemon_id_or_name):
         "+-----------------------------------+\n"
         f"| {hp:>3}  {atk:>3}  {dfe:>3}  {spa:>3}  {spd:>3}  {spe:>3} |  {total:>3}  |\n"
         "+-----------------------------------+\n"
-        "
+        "```"
+    )
+
+    biome_info, time_info = await get_pixelmon_spawn_info(english_name)
+
+    embed = discord.Embed(title=f"포켓몬 정보: {display_name}", color=0xcc0000)
+    embed.set_thumbnail(url=image_url)
+    embed.add_field(name="도감 번호", value=f"No.{species_data['id']}", inline=False)
+    embed.add_field(name="타입", value=types_str, inline=False)
+    embed.add_field(name="키", value=f"{height}m", inline=True)
+    embed.add_field(name="몸무게", value=f"{weight}kg", inline=True)
+    embed.add_field(name="⏳ 출몰 시간", value=time_info, inline=True)
+    embed.add_field(name="🍄 출몰 바이옴", value=biome_info, inline=True)
+    embed.add_field(name="🌸 종족치", value=stats_table, inline=False)
+
+    return embed, species_data
+
+# ==========================================
+# 7. 진화 / 메가진화 / 지역폼 / 원래형태 버튼 View 클래스
+# ==========================================
+class PokemonEvolutionView(discord.ui.View):
+    def __init__(self, species_data, current_pokemon_name, base_species_name=None):
+        super().__init__(timeout=120)
+        self.species_data = species_data
+        self.current_name = current_pokemon_name
+        self.base_species_name = base_species_name or species_data['name']
+        self.setup_buttons()
+
+    def setup_buttons(self):
+        if self.current_name != self.base_species_name:
+            btn = discord.ui.Button(label="🔄 원래 형태", style=discord.ButtonStyle.secondary, custom_id=f"evo_{self.base_species_name}")
+            btn.callback = self.on_evolution_click
+            self.add_item(btn)
+
+        evo_chain_url = self.species_data['evolution_chain']['url']
+        chain_res = requests.get(evo_chain_url)
+        
+        if chain_res.status_code == 200:
+            chain_data = chain_res.json()['chain']
+            prev_evo, next_evos = self.find_evolutions(chain_data, self.species_data['name'])
+
+            if prev_evo and prev_evo != self.current_name:
+                btn = discord.ui.Button(label="이전 진화", style=discord.ButtonStyle.secondary, custom_id=f"evo_{prev_evo}")
+                btn.callback = self.on_evolution_click
+                self.add_item(btn)
+
+            for next_evo in next_evos:
+                if next_evo != self.current_name:
+                    btn = discord.ui.Button(label=f"진화 ({next_evo.capitalize()})", style=discord.ButtonStyle.primary, custom_id=f"evo_{next_evo}")
+                    btn.callback = self.on_evolution_click
+                    self.add_item(btn)
+
+        varieties = self.species_data.get('varieties', [])
+        for var in varieties:
+            var_name = var['pokemon']['name']
+            if var_name == self.current_name:
+                continue
+
+            if 'mega' in var_name:
+                label_name = "메가진화"
+                if 'mega-x' in var_name: label_name = "메가진화 X"
+                elif 'mega-y' in var_name: label_name = "메가진화 Y"
+                btn = discord.ui.Button(label=f"✨ {label_name}", style=discord.ButtonStyle.success, custom_id=f"evo_{var_name}")
+                btn.callback = self.on_evolution_click
+                self.add_item(btn)
+                
+            elif 'alola' in var_name:
+                btn = discord.ui.Button(label="🏝️ 알로라 폼", style=discord.ButtonStyle.success, custom_id=f"evo_{var_name}")
+                btn.callback = self.on_evolution_click
+                self.add_item(btn)
+            elif 'galar' in var_name:
+                btn = discord.ui.Button(label="🛡️ 가라르 폼", style=discord.ButtonStyle.success, custom_id=f"evo_{var_name}")
+                btn.callback = self.on_evolution_click
+                self.add_item(btn)
+            elif 'hisui' in var_name:
+                btn = discord.ui.Button(label="📜 히스이 폼", style=discord.ButtonStyle.success, custom_id=f"evo_{var_name}")
+                btn.callback = self.on_evolution_click
+                self.add_item(btn)
+            elif 'paldea' in var_name:
+                btn = discord.ui.Button(label="🥊 팔데아 폼", style=discord.ButtonStyle.success, custom_id=f"evo_{var_name}")
+                btn.callback = self.on_evolution_click
+                self.add_item(btn)
+
+    def find_evolutions(self, chain_node, target_name):
+        if chain_node['species']['name'] == target_name:
+            next_evos = [child['species']['name'] for child in chain_node['evolves_to']]
+            return None, next_evos
+
+        for child in chain_node['evolves_to']:
+            if child['species']['name'] == target_name:
+                next_evos = [grandchild['species']['name'] for grandchild in child['evolves_to']]
+                return child['species']['name'], next_evos
+            
+            for grandchild in child['evolves_to']:
+                if grandchild['species']['name'] == target_name:
+                    return child['species']['name'], []
+        return None, []
+
+    async def on_evolution_click(self, interaction: discord.Interaction):
+        await interaction.response.defer()
+        target_pokemon = interaction.data['custom_id'].replace('evo_', '')
+        embed, new_species_data = await get_pokemon_embed_async(target_pokemon)
+
+        if embed and new_species_data:
+            new_view = PokemonEvolutionView(new_species_data, target_pokemon, self.base_species_name)
+            await interaction.followup.edit_message(message_id=interaction.message.id, embed=embed, view=new_view)
+        else:
+            await interaction.followup.send("정보를 불러올 수 없습니다.", ephemeral=True)
+
+# ==========================================
+# 8. 디스코드 이벤트 핸들러 및 실행
+# ==========================================
+@client.event
+async def on_ready():
+    await build_korean_cache()
+    print('🚀 포켓몬 봇이 완벽하게 가동되었습니다!')
+
+@client.event
+async def on_message(message):
+    if message.author == client.user:
+        return
+
+    if message.content == '!도감':
+        embed = discord.Embed(
+            title="📖 포켓몬 도감 사용법",
+            description="`!도감 [포켓몬 이름 또는 번호]` 형식으로 입력해 주세요!\n\n**예시:**\n• `!도감 나옹` / `!도감 리자몽` (지역 폼/메가진화 지원)\n• `!도감 52` (도감 번호 검색)",
+            color=0x3498db
+        )
+        await message.channel.send(embed=embed)
+
+    elif message.content.startswith('!도감 '):
+        query = message.content.split(' ')[1].strip()
+        embed, species_data = await get_pokemon_embed_async(query)
+
+        if embed and species_data:
+            base_name = species_data['name']
+            view = PokemonEvolutionView(species_data, base_name, base_name)
+            await message.channel.send(embed=embed, view=view)
+        else:
+            await message.channel.send('포켓몬을 찾을 수 없어요. 포켓몬 이름이나 번호를 정확히 입력해 주세요!')
+
+    elif message.content.startswith('!포획 '):
+        query = message.content.split(' ')[1].strip()
+        embed, species_data = await get_pokemon_embed_async(query)
+
+        if species_data:
+            pokemon_name = str(species_data['id'])
+            for name_entry in species_data['names']:
+                if name_entry['language']['name'] == 'ko':
+                    pokemon_name = name_entry['name']
+                    break
+
+            user_id = str(message.author.id)
+            user_data = collection.find_one({"_id": user_id})
+            
+            if not user_data:
+                collection.insert_one({"_id": user_id, "pokemon_list": [pokemon_name]})
+                await message.channel.send(f"🎉 앗! 야생의 **{pokemon_name}**(을)를 잡았다! (첫 포획!)")
+            else:
+                if pokemon_name not in user_data["pokemon_list"]:
+                    collection.update_one({"_id": user_id}, {"$push": {"pokemon_list": pokemon_name}})
+                    await message.channel.send(f"🎉 앗! 야생의 **{pokemon_name}**(을)를 잡았다! (내 도감에 저장됨)")
+                else:
+                    await message.channel.send("이미 내 도감에 등록된 포켓몬입니다.")
+        else:
+            await message.channel.send("존재하지 않는 포켓몬입니다. 정확한 이름이나 번호를 입력해 주세요!")
+
+    elif message.content == '!내포켓몬':
+        user_id = str(message.author.id)
+        user_data = collection.find_one({"_id": user_id})
+        
+        if user_data and len(user_data["pokemon_list"]) > 0:
+            pokemon_list = ", ".join(user_data["pokemon_list"])
+            await message.channel.send(f"📖 **{message.author.display_name}님의 포켓몬 도감**\n{pokemon_list}")
+        else:
+            await message.channel.send("아직 잡은 포켓몬이 없습니다.")
+
+    elif message.content == '!순위':
+        all_users = collection.find()
+        ranking = []
+        for user in all_users:
+            count = len(user.get("pokemon_list", []))
+            ranking.append((user["_id"], count))
+        
+        if not ranking:
+            await message.channel.send("아직 포켓몬을 잡은 사람이 아무도 없습니다!")
+            return
+        
+        ranking.sort(key=lambda x: x[1], reverse=True)
+        embed = discord.Embed(title="🏆 포켓몬 헌터 순위 TOP 5", color=0xffd700)
+        
+        for i, (user_id, count) in enumerate(ranking[:5]):
+            discord_user = client.get_user(int(user_id))
+            name = discord_user.display_name if discord_user else "알 수 없는 헌터"
+            medals = ["🥇", "🥈", "🥉", "🏅", "🏅"]
+            medal = medals[i]
+            embed.add_field(name=f"{medal} {i+1}위: {name}", value=f"총 {count}마리 포획", inline=False)
+            
+        await message.channel.send(embed=embed)
+
+keep_alive()
+client.run(os.environ.get('DISCORD_TOKEN'))
