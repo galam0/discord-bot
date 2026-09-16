@@ -26,7 +26,7 @@ def keep_alive():
     t.start()
 
 # ==========================================
-# 2. 디스코드 봇 설정 (MongoDB 제거됨)
+# 2. 디스코드 봇 설정
 # ==========================================
 intents = discord.Intents.default()
 intents.message_content = True
@@ -84,6 +84,7 @@ FORM_TRANSLATIONS = {
     'unbound': ('굴레를 벗어난 폼', '🌀', discord.ButtonStyle.danger),
     'sky': ('스카이 폼', '🌱', discord.ButtonStyle.success),
     'hero': ('마이티 폼', '🦸', discord.ButtonStyle.primary),
+    'normal': ('노말 폼', '🔄', discord.ButtonStyle.secondary),
 }
 
 # ==========================================
@@ -254,7 +255,7 @@ async def get_pixelmon_spawn_info(english_name):
         return ("정보 없음", "Any")
 
 # ==========================================
-# 5. 한국어 사전 구축 및 ID 변환
+# 5. 한국어 사전 구축 및 ID 변환 (문지기 해제 완료)
 # ==========================================
 async def fetch_species_name(session, item):
     try:
@@ -279,24 +280,40 @@ async def build_korean_cache():
 def resolve_pokemon_id(query):
     query = query.strip().lower()
     if query.isdigit(): return query
-    if any(form in query for form in ['mega', 'alola', 'galar', 'hisui', 'paldea', 'black', 'white', 'primal']): return query
     if query in POKEMON_KO_TO_ID: return POKEMON_KO_TO_ID[query]
+    
+    # 순수 영문(버튼에서 넘겨준 폼 데이터)이면 무조건 통과!
+    if not re.search(r'[가-힣]', query):
+        return query
+        
     try:
         res = requests.get(f'https://pokeapi.co/api/v2/pokemon-species/{query}')
         if res.status_code == 200: return str(res.json()['id'])
     except: pass
+    
     return None
 
 # ==========================================
-# 6. Embed 생성기
+# 6. Embed 생성기 (조회 버그 수정 완료)
 # ==========================================
 async def get_pokemon_embed_async(pokemon_id_or_name):
     query = str(pokemon_id_or_name).strip().lower()
     pokemon_id = resolve_pokemon_id(query)
     if not pokemon_id: return None, None
 
-    species_name = query.split('-')[0] if '-' in query else pokemon_id
-    species_res = requests.get(f'https://pokeapi.co/api/v2/pokemon-species/{species_name}')
+    # 상세 정보(폼 데이터)부터 다이렉트로 가져옵니다
+    detail_url = f'https://pokeapi.co/api/v2/pokemon/{query}'
+    detail_res = requests.get(detail_url)
+    if detail_res.status_code != 200:
+        detail_url = f'https://pokeapi.co/api/v2/pokemon/{pokemon_id}'
+        detail_res = requests.get(detail_url)
+
+    if detail_res.status_code != 200: return None, None
+    data = detail_res.json()
+
+    # 상세 데이터 안의 종족(Species) 원본 주소를 사용
+    species_url = data['species']['url']
+    species_res = requests.get(species_url)
     if species_res.status_code != 200: return None, None
     species_data = species_res.json()
 
@@ -306,31 +323,25 @@ async def get_pokemon_embed_async(pokemon_id_or_name):
             display_name = name_entry['name']
             break
 
-    detail_res = requests.get(f'https://pokeapi.co/api/v2/pokemon/{query}')
-    if detail_res.status_code != 200:
-        detail_res = requests.get(f'https://pokeapi.co/api/v2/pokemon/{pokemon_id}')
-    if detail_res.status_code != 200: return None, None
-        
-    data = detail_res.json()
     image_url = data['sprites']['other']['official-artwork']['front_default'] or data['sprites']['front_default']
 
-    # 폼 이름 예쁘게 포맷팅
-    if 'alola' in query: display_name = f"알로라 {display_name}"
-    elif 'galar' in query: display_name = f"가라르 {display_name}"
-    elif 'hisui' in query: display_name = f"히스이 {display_name}"
-    elif 'paldea' in query: display_name = f"팔데아 {display_name}"
-    elif 'primal' in query: display_name = f"원시{display_name}"
-    elif 'mega-x' in query: display_name = f"메가{display_name} X"
-    elif 'mega-y' in query: display_name = f"메가{display_name} Y"
-    elif 'mega' in query: display_name = f"메가{display_name}"
-    elif 'black' in query: display_name = f"블랙{display_name}"
-    elif 'white' in query: display_name = f"화이트{display_name}"
-    elif 'dusk' in query: display_name = f"{display_name} (황혼의 갈기)"
-    elif 'dawn' in query: display_name = f"{display_name} (새벽의 날개)"
-    elif 'ultra' in query: display_name = f"울트라{display_name}"
-    elif '10' in query: display_name = f"{display_name} (10% 폼)"
-    elif 'complete' in query: display_name = f"{display_name} (퍼펙트 폼)"
-    elif 'school' in query: display_name = f"{display_name} (군집의 모습)"
+    # 폼 이름 예쁘게 포맷팅 (번역 사전 연동 자동화)
+    form_applied = False
+    for key, (k_name, _, _) in FORM_TRANSLATIONS.items():
+        if key in query:
+            if key in ['mega-x', 'mega-y', 'mega', 'alola', 'galar', 'hisui', 'paldea', 'primal', 'black', 'white', 'ultra']:
+                display_name = f"{k_name.replace(' 폼', '').replace('진화', '')} {display_name}"
+            else:
+                display_name = f"{display_name} ({k_name})"
+            form_applied = True
+            break
+            
+    # 사전에 없는 마이너 폼은 영어 단어를 추출해 괄호로 자동 처리
+    if not form_applied and '-' in query:
+        base_eng = species_data['name']
+        form_suffix = query.replace(f"{base_eng}-", "").replace("-", " ")
+        if form_suffix != query:
+            display_name = f"{display_name} ({form_suffix.title()} 폼)"
 
     types_list = [TYPE_KO.get(t['type']['name'], t['type']['name'].capitalize()) for t in data['types']]
     types_str = ", ".join(types_list)
@@ -482,7 +493,6 @@ async def on_message(message):
     if message.author == client.user:
         return
 
-    # !도감 명령어로 다시 롤백
     if message.content.startswith('!도감 '):
         query = message.content.split(' ')[1].strip()
         embed, species_data = await get_pokemon_embed_async(query)
