@@ -255,7 +255,7 @@ async def get_pixelmon_spawn_info(english_name):
         return ("정보 없음", "Any")
 
 # ==========================================
-# 5. 한국어 사전 구축 및 ID 변환 (문지기 해제 완료)
+# 5. 한국어 사전 구축 및 ID 변환 
 # ==========================================
 async def fetch_species_name(session, item):
     try:
@@ -282,7 +282,6 @@ def resolve_pokemon_id(query):
     if query.isdigit(): return query
     if query in POKEMON_KO_TO_ID: return POKEMON_KO_TO_ID[query]
     
-    # 순수 영문(버튼에서 넘겨준 폼 데이터)이면 무조건 통과!
     if not re.search(r'[가-힣]', query):
         return query
         
@@ -294,14 +293,13 @@ def resolve_pokemon_id(query):
     return None
 
 # ==========================================
-# 6. Embed 생성기 (조회 버그 수정 완료)
+# 6. Embed 생성기 
 # ==========================================
 async def get_pokemon_embed_async(pokemon_id_or_name):
     query = str(pokemon_id_or_name).strip().lower()
     pokemon_id = resolve_pokemon_id(query)
     if not pokemon_id: return None, None
 
-    # 상세 정보(폼 데이터)부터 다이렉트로 가져옵니다
     detail_url = f'https://pokeapi.co/api/v2/pokemon/{query}'
     detail_res = requests.get(detail_url)
     if detail_res.status_code != 200:
@@ -311,7 +309,6 @@ async def get_pokemon_embed_async(pokemon_id_or_name):
     if detail_res.status_code != 200: return None, None
     data = detail_res.json()
 
-    # 상세 데이터 안의 종족(Species) 원본 주소를 사용
     species_url = data['species']['url']
     species_res = requests.get(species_url)
     if species_res.status_code != 200: return None, None
@@ -325,7 +322,6 @@ async def get_pokemon_embed_async(pokemon_id_or_name):
 
     image_url = data['sprites']['other']['official-artwork']['front_default'] or data['sprites']['front_default']
 
-    # 폼 이름 예쁘게 포맷팅 (번역 사전 연동 자동화)
     form_applied = False
     for key, (k_name, _, _) in FORM_TRANSLATIONS.items():
         if key in query:
@@ -336,7 +332,6 @@ async def get_pokemon_embed_async(pokemon_id_or_name):
             form_applied = True
             break
             
-    # 사전에 없는 마이너 폼은 영어 단어를 추출해 괄호로 자동 처리
     if not form_applied and '-' in query:
         base_eng = species_data['name']
         form_suffix = query.replace(f"{base_eng}-", "").replace("-", " ")
@@ -428,7 +423,7 @@ class PokemonEvolutionView(discord.ui.View):
         except Exception:
             pass
 
-        # 3. 폼 체인지 버튼 자동 매핑 (사전 + 자동 생성)
+        # 3. 폼 체인지 버튼 자동 매핑
         varieties = self.species_data.get('varieties', [])
         for var in varieties:
             var_name = var['pokemon']['name']
@@ -442,13 +437,11 @@ class PokemonEvolutionView(discord.ui.View):
 
             label_name, emoji, style = None, "🔄", discord.ButtonStyle.secondary
 
-            # 사전(FORM_TRANSLATIONS)에서 키워드 확인 및 적용
             for key, (k_name, k_emoji, k_style) in FORM_TRANSLATIONS.items():
                 if key in var_name:
                     label_name, emoji, style = k_name, k_emoji, k_style
                     break
             
-            # 사전에 없는 마이너 폼은 자동으로 이름 생성
             if not label_name:
                 form_suffix = var_name.replace(f"{self.base_species_name}-", "").replace("-", " ")
                 label_name = f"{form_suffix.title()} 폼"
@@ -469,16 +462,23 @@ class PokemonEvolutionView(discord.ui.View):
                     return child['species']['name'], []
         return None, []
 
+    # 🚨 상호작용(버튼) 클릭 시 429 에러 방지 처리 추가
     async def on_evolution_click(self, interaction: discord.Interaction):
-        await interaction.response.defer()
-        target_pokemon = interaction.data['custom_id'].replace('evo_', '')
-        embed, new_species_data = await get_pokemon_embed_async(target_pokemon)
+        try:
+            await interaction.response.defer()
+            target_pokemon = interaction.data['custom_id'].replace('evo_', '')
+            embed, new_species_data = await get_pokemon_embed_async(target_pokemon)
 
-        if embed and new_species_data:
-            new_view = PokemonEvolutionView(new_species_data, target_pokemon, self.base_species_name)
-            await interaction.followup.edit_message(message_id=interaction.message.id, embed=embed, view=new_view)
-        else:
-            await interaction.followup.send("폼 체인지 정보를 불러올 수 없습니다.", ephemeral=True)
+            if embed and new_species_data:
+                new_view = PokemonEvolutionView(new_species_data, target_pokemon, self.base_species_name)
+                await interaction.followup.edit_message(message_id=interaction.message.id, embed=embed, view=new_view)
+            else:
+                await interaction.followup.send("폼 체인지 정보를 불러올 수 없습니다.", ephemeral=True)
+        except discord.HTTPException as e:
+            if e.status == 429:
+                print("[경고] 버튼 클릭 중 디스코드 API 레이트 리밋(429) 발생. (무시됨)")
+            else:
+                print(f"[오류] 상호작용 실패: {e}")
 
 # ==========================================
 # 8. 디스코드 이벤트 핸들러 및 실행
@@ -497,19 +497,21 @@ async def on_message(message):
         query = message.content.split(' ')[1].strip()
         embed, species_data = await get_pokemon_embed_async(query)
 
-        if embed and species_data:
-            base_name = species_data['name']
-            view = PokemonEvolutionView(species_data, base_name, base_name)
-            try:
+        # 🚨 일반 메시지 전송 시 429 에러 방지 및 무한 루프 차단 처리 추가
+        try:
+            if embed and species_data:
+                base_name = species_data['name']
+                view = PokemonEvolutionView(species_data, base_name, base_name)
                 await message.channel.send(embed=embed, view=view)
-            except discord.HTTPException as e:
-                if e.status == 429:
-                    await asyncio.sleep(2)
-                    await message.channel.send(embed=embed, view=view)
-                else:
-                    raise e
-        else:
-            await message.channel.send('포켓몬을 찾을 수 없어요. 포켓몬 이름이나 번호를 정확히 입력해 주세요!')
+            else:
+                await message.channel.send('포켓몬을 찾을 수 없어요. 포켓몬 이름이나 번호를 정확히 입력해 주세요!')
+        except discord.HTTPException as e:
+            if e.status == 429:
+                print(f"[{message.author.name}] 요청 거부됨: 디스코드 API 레이트 리밋(429) 상태입니다.")
+            else:
+                print(f"[디스코드 에러] 메시지 전송 실패: {e}")
+        except Exception as e:
+            print(f"[알 수 없는 에러] {e}")
 
 keep_alive()
 client.run(os.environ.get('DISCORD_TOKEN'))
