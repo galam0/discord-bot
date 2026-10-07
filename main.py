@@ -857,7 +857,7 @@ def _stat_color(v):
     if v < 120: return "#7ed37a"
     return "#4fc3f7"
 
-CARD_SCALE = 2          # 2배로 그린 뒤 축소 (테두리가 매끈해짐). 서버가 아주 느리면 1로
+CARD_SCALE = 1          # 1: 빠름 (Render 무료 서버용) / 2: 2배로 그린 뒤 축소해서 테두리가 더 매끈하지만 느림
 TOP_BG_H = 460          # 그라데이션 + 빛 효과가 들어가는 상단 영역 높이
 _TOP_BG_CACHE = {}
 _GLOW_MASK = None
@@ -920,7 +920,7 @@ def render_card(info):
     if info.get('art'):
         try:
             art = Image.open(BytesIO(info['art'])).convert("RGBA")
-            art.thumbnail((320 * S, 320 * S), Image.BILINEAR)
+            art.thumbnail((250 * S, 250 * S), Image.BILINEAR)  # 공식 일러스트(475px)가 이전과 비슷한 크기로
             ax = 220 * S - art.width // 2
             ay = 220 * S - art.height // 2
             img.paste(art, (ax, ay), art)
@@ -1043,6 +1043,17 @@ def make_embed(info):
     embed.add_field(name="⏳ 출몰 시간", value=info['time'], inline=True)
     embed.add_field(name="🌸 종족치", value="```text\n" + "\n".join(lines) + "\n```", inline=False)
     return embed
+
+def warmup_card():
+    """폰트 로딩, 빛 효과 계산 등 첫 렌더에만 드는 준비 작업을 미리 해둠"""
+    dummy = {
+        'no': 0, 'name': '준비', 'file_name': 'warmup', 'types': ['normal'],
+        'ability': '-', 'hidden': '-', 'egg': '-', 'hatch': '-', 'catch': '-',
+        'biomes': ['Plains'], 'biome_empty': None, 'time': 'Any',
+        'stats': {k: 50 for k, _ in STAT_ROWS}, 'rarity': 'legendary', 'image_url': None, 'art': None,
+    }
+    render_card(dummy)
+    _TOP_BG_CACHE.clear()  # 더미용 배경은 버림 (빛 효과 모양과 폰트는 그대로 남음)
 
 async def render_png(info):
     """이미지 카드 PNG 바이트. 폰트가 없거나 실패하면 None (→ 텍스트 embed로 대체)"""
@@ -1264,6 +1275,9 @@ class PokemonBot(discord.Client):
         self._cache_task = asyncio.create_task(build_korean_cache())
         # 전설 포켓몬 페이지는 크고 자주 쓰여서 미리 받아 둠 (첫 전설 검색이 느리지 않게)
         self._legend_task = asyncio.create_task(parse_legendary_spawn_table("__warmup__"))
+        # 카드 렌더 준비 작업도 미리 (별도 스레드라 봇은 멈추지 않음)
+        if CARD_ENABLED:
+            self._card_warmup = asyncio.create_task(asyncio.to_thread(warmup_card))
 
     async def close(self):
         if HTTP_SESSION and not HTTP_SESSION.closed:
