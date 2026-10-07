@@ -194,8 +194,7 @@ async def get_pokemon_extra_info(data, species_data):
             target.append(name)
 
     ability_text = ", ".join(normal_abilities) or "정보 없음"
-    if hidden_abilities:
-        ability_text += f"\n(숨겨진: {', '.join(hidden_abilities)})"
+    hidden_text = ", ".join(hidden_abilities) or "없음"
 
     egg_groups = []
     for group in species_data.get('egg_groups', []):
@@ -210,7 +209,7 @@ async def get_pokemon_extra_info(data, species_data):
     capture_rate = species_data.get('capture_rate')
     catch_text = str(capture_rate) if capture_rate is not None else "정보 없음"
 
-    return ability_text, egg_group_text, hatch_text, catch_text
+    return ability_text, hidden_text, egg_group_text, hatch_text, catch_text
 
 # ==========================================
 # 6. 픽셀몬 위키 스폰 정보 (바닐라 바이옴만)
@@ -480,7 +479,7 @@ async def build_embed(data, species_data):
         f"{border}```"
     )
 
-    (biome_info, time_info), (ability_text, egg_group_text, hatch_text, catch_text) = await asyncio.gather(
+    (biome_info, time_info), (ability_text, hidden_text, egg_group_text, hatch_text, catch_text) = await asyncio.gather(
         get_pixelmon_spawn_info(species_data['name']),
         get_pokemon_extra_info(data, species_data),
     )
@@ -497,10 +496,10 @@ async def build_embed(data, species_data):
     embed.add_field(name="📖 도감 번호", value=f"No.{species_data['id']}", inline=False)
     embed.add_field(name="⚔️ 타입", value=types_str, inline=True)
     embed.add_field(name="🛡️ 특성", value=ability_text, inline=True)
+    embed.add_field(name="🔒 숨겨진 특성", value=hidden_text, inline=True)
     embed.add_field(name="🥚 알 그룹", value=egg_group_text, inline=True)
     embed.add_field(name="🎯 포획률", value=catch_text, inline=True)
     embed.add_field(name="🐣 부화 걸음 수", value=hatch_text, inline=True)
-    embed.add_field(name="\u200b", value="\u200b", inline=True)
     embed.add_field(name="🍄 출몰 바이옴", value=biome_info, inline=True)
     embed.add_field(name="⏳ 출몰 시간", value=time_info, inline=True)
     embed.add_field(name="🌸 종족치", value=stats_table, inline=False)
