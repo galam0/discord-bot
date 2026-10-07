@@ -169,10 +169,12 @@ async def build_korean_cache_graphql():
         async with HTTP_SEM:
             async with HTTP_SESSION.post(GRAPHQL_URL, json={"query": KO_NAMES_QUERY}) as r:
                 if r.status != 200:
+                    print(f"[GraphQL] 응답 코드 {r.status}, 기존 방식으로 전환")
                     return False
                 body = await r.json()
-        rows = body.get("data", {}).get("pokemonspeciesname") or []
+        rows = (body.get("data") or {}).get("pokemonspeciesname") or []
         if len(rows) < 900:  # 이상하게 적으면 믿지 않고 기존 방식으로
+            print(f"[GraphQL] 결과 {len(rows)}개 / 오류: {body.get('errors')}, 기존 방식으로 전환")
             return False
         for row in rows:
             ko, sid = row.get("name"), row.get("pokemon_species_id")
@@ -205,7 +207,7 @@ async def build_korean_cache():
     if failed:  # 실패한 것만 한 번 재시도
         await asyncio.gather(*(fetch_species_name(u) for u in failed))
     KOREAN_CACHE_READY = True
-    print(f"✅ 데이터베이스 수집 완료! ({len(POKEMON_KO_TO_ID)}종)")
+    print(f"✅ 데이터베이스 수집 완료! ({len(POKEMON_KO_TO_ID)}종, 기존 방식 {time.perf_counter() - t:.1f}초)")
 
 def ko_name(species_en):
     return SPECIES_EN_TO_KO.get(species_en, species_en.replace('-', ' ').title())
@@ -297,6 +299,43 @@ def clean_biome_text(text):
 def extract_times(text):
     return [tk for tk in TIME_ORDER if re.search(rf"\b{re.escape(tk)}\b", text or "", re.IGNORECASE)]
 
+def slice_wiki_section(html, anchor_id, heading_text):
+    """
+    위키 HTML 전체(수백 KB)를 해석하지 않고, 원하는 제목부터 그 아래 첫 표까지만 잘라냄.
+    약한 서버에서 BeautifulSoup으로 페이지 전체를 읽는 게 가장 느린 부분이라서.
+    """
+    m = re.search(rf'id="{anchor_id}"', html)
+    if not m:
+        m = re.search(rf'<h[23][^>]*>(?:(?!</h[23]>).){{0,400}}?{heading_text}', html, re.I | re.S)
+    if not m:
+        return ""
+    i = m.start()
+    start = max(html.rfind('<h2', 0, i), html.rfind('<h3', 0, i))
+    start = i if start < 0 else start
+    end = html.find('</table>', i)
+    return html[start:end + 8] if end >= 0 else ""
+
+WIKI_SECTIONS_CACHE = OrderedDict()
+
+async def get_wiki_sections(species_name):
+    """포켓몬 위키 페이지에서 스폰/드랍/지닌 물건 부분만 잘라서 보관 (도감 카드와 아이템 버튼이 같이 씀)"""
+    if species_name in WIKI_SECTIONS_CACHE:
+        WIKI_SECTIONS_CACHE.move_to_end(species_name)
+        return WIKI_SECTIONS_CACHE[species_name]
+    encoded = quote(wiki_title(species_name), safe="_:'.-")
+    status, html = await fetch_text(f"{WIKI_BASE}/wiki/{encoded}")
+    if status == 0:
+        return None  # 연결 실패 (캐시 안 함)
+    secs = {'found': status == 200, 'spawn': "", 'drops': "", 'held': ""}
+    if status == 200:
+        secs['spawn'] = slice_wiki_section(html, r"Spawn_Biomes[^\"]*", "Spawn Biomes")
+        secs['drops'] = slice_wiki_section(html, r"Drops[^\"]*", "Drops")
+        secs['held'] = slice_wiki_section(html, r"Held_items?[^\"]*", "Held item")
+    WIKI_SECTIONS_CACHE[species_name] = secs
+    if len(WIKI_SECTIONS_CACHE) > 400:
+        WIKI_SECTIONS_CACHE.popitem(last=False)
+    return secs
+
 async def expand_biome_link(href, label):
     """
     링크가 'Arid' 같은 바이옴 카테고리 페이지면 그 안의 '바닐라' 바이옴 목록으로 펼치고,
@@ -315,24 +354,20 @@ async def expand_biome_link(href, label):
         BIOME_LINK_CACHE[href] = result
         return result
 
-    soup = BeautifulSoup(html, "html.parser")
-    content = soup.find(id="mw-content-text") or soup
-
     vanilla_names, found_vanilla_table = [], False
-    for h in content.find_all(["h2", "h3"]):
-        if "vanilla" in h.get_text(" ", strip=True).lower():
-            table = h.find_next("table")
-            if table and "biome id" in table.get_text(" ", strip=True).lower():
-                found_vanilla_table = True
-                for row in table.find_all("tr"):
-                    td = row.find("td")
-                    if td:
-                        vanilla_names.extend(clean_biome_text(td.get_text(" ", strip=True)))
-            break
+    fragment = slice_wiki_section(html, r"Vanilla[^\"]*", "Vanilla")
+    if fragment:
+        table = BeautifulSoup(fragment, "html.parser").find("table")
+        if table and "biome id" in table.get_text(" ", strip=True).lower():
+            found_vanilla_table = True
+            for row in table.find_all("tr"):
+                td = row.find("td")
+                if td:
+                    vanilla_names.extend(clean_biome_text(td.get_text(" ", strip=True)))
 
     if found_vanilla_table:
         result = vanilla_names
-    elif re.search(r"is a biome category", content.get_text(" ", strip=True), re.IGNORECASE):
+    elif re.search(r"is a biome category", re.sub(r"<[^>]+>", "", html), re.IGNORECASE):
         result = []  # 카테고리지만 바닐라 바이옴이 없음 (모드 전용)
     else:
         result = clean_biome_text(label)  # 일반 바이옴 페이지
@@ -391,7 +426,8 @@ async def parse_legendary_spawn_table(title):
         status, html = await fetch_text(f"{WIKI_BASE}/wiki/Legendary_Pokemon")
         if status != 200:
             return set(), set()
-        LEGENDARY_SOUP = BeautifulSoup(html, "html.parser")
+        # 큰 페이지라 해석이 오래 걸림 → 별도 스레드에서 (그동안 봇이 멈추지 않게)
+        LEGENDARY_SOUP = await asyncio.to_thread(BeautifulSoup, html, "html.parser")
 
     target = normalize_wiki_name(title)
     for table in LEGENDARY_SOUP.find_all("table"):
@@ -410,14 +446,13 @@ async def get_pixelmon_spawn_info(species_name):
         return PIXELMON_SPAWN_CACHE[species_name]
 
     title = wiki_title(species_name)
-    encoded = quote(title, safe="_:'.-")
-    status, html = await fetch_text(f"{WIKI_BASE}/wiki/{encoded}")
-    if status == 0:
+    secs = await get_wiki_sections(species_name)
+    if secs is None:
         return ([], "정보 없음 (위키 연결 실패)", "Any")
 
     biomes, times, had_rows = set(), set(), False
-    if status == 200:
-        biomes, times, had_rows = await parse_normal_spawn_table(BeautifulSoup(html, "html.parser"))
+    if secs['spawn']:
+        biomes, times, had_rows = await parse_normal_spawn_table(BeautifulSoup(secs['spawn'], "html.parser"))
 
     if not had_rows:
         l_biomes, l_times = await parse_legendary_spawn_table(title.replace('_', ' '))
@@ -530,15 +565,15 @@ async def get_pixelmon_items(species_name):
     """{'drops': [(이름, 확률, 수량)], 'held': [(이름, 확률, '')]} 또는 연결 실패 시 None"""
     if species_name in PIXELMON_ITEMS_CACHE:
         return PIXELMON_ITEMS_CACHE[species_name]
-    encoded = quote(wiki_title(species_name), safe="_:'.-")
-    status, html = await fetch_text(f"{WIKI_BASE}/wiki/{encoded}")
-    if status == 0:
+    secs = await get_wiki_sections(species_name)
+    if secs is None:
         return None
     result = {'drops': [], 'held': []}
-    if status == 200:
-        soup = BeautifulSoup(html, "html.parser")
-        result['drops'] = _parse_item_table(soup, {"drops"}, 'drop', True)
-        result['held'] = _parse_item_table(soup, {"held item", "held items"}, 'item', False)
+    if secs['drops']:
+        result['drops'] = _parse_item_table(BeautifulSoup(secs['drops'], "html.parser"), {"drops"}, 'drop', True)
+    if secs['held']:
+        result['held'] = _parse_item_table(BeautifulSoup(secs['held'], "html.parser"),
+                                           {"held item", "held items"}, 'item', False)
 
     # 아이템 이름 한글화
     for k in ('drops', 'held'):
@@ -969,7 +1004,8 @@ def render_card(info):
 
     out = BytesIO()
     final = img.reduce(S) if S > 1 else img  # 정확히 S배 축소는 reduce가 resize보다 훨씬 빠름
-    final.save(out, format="PNG", compress_level=1)  # optimize=True는 0.3초 걸려서 끔
+    # JPEG가 PNG보다 저장이 훨씬 빠르고 용량도 작음 (투명 배경이 없어서 화질 차이 거의 없음)
+    final.save(out, format="JPEG", quality=92, subsampling=0)  # optimize=True는 0.3초 걸려서 끔
     out.seek(0)
     return out
 
@@ -1098,7 +1134,7 @@ async def build_pokemon_message(query):
     if cached_png is not None:
         CARD_PNG_CACHE.move_to_end(data['name'])
         _log_timings(data['name'] + " (캐시)", timings, time.perf_counter() - t_start)
-        return {'file': discord.File(BytesIO(cached_png), filename=f"{data['name']}.png")}, view
+        return {'file': discord.File(BytesIO(cached_png), filename=f"{data['name']}.jpg")}, view
 
     info = assemble_info(data, species_data, form_ko, spawn, extra, art)
     png = await _timed("렌더", render_png(info), timings)
@@ -1111,7 +1147,7 @@ async def build_pokemon_message(query):
         CARD_PNG_CACHE[data['name']] = png
         if len(CARD_PNG_CACHE) > 150:
             CARD_PNG_CACHE.popitem(last=False)
-    payload = {'file': discord.File(BytesIO(png), filename=f"{data['name']}.png")}
+    payload = {'file': discord.File(BytesIO(png), filename=f"{data['name']}.jpg")}
     return payload, view
 
 # ==========================================
@@ -1226,6 +1262,8 @@ class PokemonBot(discord.Client):
         HTTP_SEM = asyncio.Semaphore(10)
         # setup_hook은 최초 1회만 실행 → 재연결 시 중복 수집 없음
         self._cache_task = asyncio.create_task(build_korean_cache())
+        # 전설 포켓몬 페이지는 크고 자주 쓰여서 미리 받아 둠 (첫 전설 검색이 느리지 않게)
+        self._legend_task = asyncio.create_task(parse_legendary_spawn_table("__warmup__"))
 
     async def close(self):
         if HTTP_SESSION and not HTTP_SESSION.closed:
