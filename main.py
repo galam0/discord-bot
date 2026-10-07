@@ -5,6 +5,7 @@ import asyncio
 import aiohttp
 import traceback
 import unicodedata
+import time
 from collections import OrderedDict
 from urllib.parse import quote
 from io import BytesIO
@@ -315,6 +316,7 @@ async def parse_normal_spawn_table(soup):
         return biomes, times, had_rows
 
     col = {'biome': 0, 'modid': 1, 'time': 2}
+    biome_cells = []
     for row in table.find_all("tr"):
         cells = row.find_all(["th", "td"], recursive=False)
         texts = [c.get_text(" ", strip=True) for c in cells]
@@ -332,8 +334,12 @@ async def parse_normal_spawn_table(soup):
         if lowered[col['modid']] not in VANILLA_MOD_IDS:
             continue  # 모드 바이옴 행은 건너뜀
 
-        biomes.update(await expand_biome_cell(cells[col['biome']]))
+        biome_cells.append(cells[col['biome']])
         times.update(extract_times(texts[col['time']]))
+
+    # 카테고리 페이지 조회를 행마다 기다리지 않고 한꺼번에 병렬 처리
+    for result in await asyncio.gather(*(expand_biome_cell(c) for c in biome_cells)):
+        biomes.update(result)
     return biomes, times, had_rows
 
 async def parse_legendary_spawn_table(title):
@@ -691,7 +697,7 @@ async def fetch_bytes(url):
         ART_CACHE.popitem(last=False)
     return raw
 
-async def collect_info(data, species_data, form_ko):
+def make_display_name(data, species_data, form_ko):
     display_name = ko_name(species_data['name'])
     for entry in species_data.get('names', []):
         if entry['language']['name'] == 'ko':
@@ -706,17 +712,17 @@ async def collect_info(data, species_data, form_ko):
             display_name = label  # 예: '지우개굴닌자'
         else:
             display_name = f"{display_name} ({label})"
+    return display_name
 
+def get_image_url(data):
     sprites = data.get('sprites', {})
-    image_url = (sprites.get('other', {}).get('official-artwork', {}).get('front_default')
-                 or sprites.get('front_default'))
+    return (sprites.get('other', {}).get('official-artwork', {}).get('front_default')
+            or sprites.get('front_default'))
 
-    (biomes, biome_empty, time_text), (ability, hidden, egg, hatch, catch), art = await asyncio.gather(
-        get_pixelmon_spawn_info(species_data['name']),
-        get_pokemon_extra_info(data, species_data),
-        fetch_bytes(image_url) if CARD_ENABLED else asyncio.sleep(0, result=None),
-    )
-
+def assemble_info(data, species_data, form_ko, spawn, extra, art):
+    (biomes, biome_empty, time_text), (ability, hidden, egg, hatch, catch) = spawn, extra
+    display_name = make_display_name(data, species_data, form_ko)
+    image_url = get_image_url(data)
     rarity = 'legendary' if species_data.get('is_legendary') else (
              'mythical' if species_data.get('is_mythical') else None)
 
@@ -900,7 +906,7 @@ def render_card(info):
         d.rounded_rectangle(p(bar_x, yy + 4, bar_x + fw, yy + 18), radius=7 * S, fill=_stat_color(v))
 
     out = BytesIO()
-    img.resize((W, H), Image.LANCZOS).save(out, format="PNG", optimize=True)
+    img.resize((W, H), Image.LANCZOS).save(out, format="PNG", compress_level=1)  # optimize=True는 0.3초 걸려서 끔
     out.seek(0)
     return out
 
@@ -939,15 +945,15 @@ def make_embed(info):
     embed.add_field(name="🌸 종족치", value="```text\n" + "\n".join(lines) + "\n```", inline=False)
     return embed
 
-async def build_payload(info):
-    """{'file': ...} (이미지 카드) 또는 {'embed': ...} (대체)"""
-    if CARD_ENABLED:
-        try:
-            buf = await asyncio.to_thread(render_card, info)
-            return {'file': discord.File(buf, filename=f"{info['file_name']}.png")}
-        except Exception:
-            traceback.print_exc()
-    return {'embed': make_embed(info)}
+async def render_png(info):
+    """이미지 카드 PNG 바이트. 폰트가 없거나 실패하면 None (→ 텍스트 embed로 대체)"""
+    if not CARD_ENABLED:
+        return None
+    try:
+        return (await asyncio.to_thread(render_card, info)).getvalue()
+    except Exception:
+        traceback.print_exc()
+        return None
 
 def edit_kwargs(payload):
     """메시지 수정 시: 이미지↔embed 전환을 모두 처리"""
@@ -955,13 +961,48 @@ def edit_kwargs(payload):
         return {'attachments': [payload['file']], 'embed': None}
     return {'embed': payload['embed'], 'attachments': []}
 
-async def build_pokemon_message(query):
-    """(payload, view) 또는 None"""
+CARD_PNG_CACHE = OrderedDict()  # 완성된 카드 이미지 (포켓몬 이름 → PNG 바이트)
+
+async def fetch_pokemon_and_species(query):
+    q = query.strip().lower()
+    sid = None
+    if re.search(r'[가-힣]', q):
+        sid = POKEMON_KO_TO_ID.get(q.replace(' ', ''))
+        if not sid:
+            return None, None
+    elif q.isdigit():
+        sid = q
+
+    if sid:
+        # 번호를 이미 알면 포켓몬/종 정보를 동시에 요청
+        data, species_data = await asyncio.gather(
+            fetch_json(f"{POKEAPI}/pokemon/{sid}"), fetch_json(f"{POKEAPI}/pokemon-species/{sid}"))
+        if data and (not species_data or species_data['name'] != data['species']['name']):
+            species_data = await fetch_json(data['species']['url'])
+        return data, species_data
+
     data = await fetch_pokemon(query)
     if not data:
-        return None
-    species_data = await fetch_json(data['species']['url'])
-    if not species_data:
+        return None, None
+    return data, await fetch_json(data['species']['url'])
+
+async def _timed(name, coro, timings):
+    t = time.perf_counter()
+    try:
+        return await coro
+    finally:
+        timings[name] = time.perf_counter() - t
+
+def _log_timings(pokemon_name, timings, total):
+    parts = " | ".join(f"{k} {v:.2f}s" for k, v in timings.items())
+    print(f"[⏱ {pokemon_name}] 총 {total:.2f}s | {parts}")
+
+async def build_pokemon_message(query):
+    """(payload, view) 또는 None"""
+    t_start = time.perf_counter()
+    timings = {}
+    data, species_data = await _timed("포켓몬/종", fetch_pokemon_and_species(query), timings)
+    if not data or not species_data:
         return None
 
     async def get_chain():
@@ -978,10 +1019,36 @@ async def build_pokemon_message(query):
         results = await asyncio.gather(*(get_form_ko_name(n) for n in names))
         return {n: ko for n, ko in zip(names, results) if ko}
 
-    chain, form_ko = await asyncio.gather(get_chain(), get_form_names())
-    info = await collect_info(data, species_data, form_ko)
-    payload = await build_payload(info)
+    cached_png = CARD_PNG_CACHE.get(data['name']) if CARD_ENABLED else None
+    need_art = CARD_ENABLED and cached_png is None
+
+    # 진화 / 폼 이름 / 스폰 / 특성 / 일러스트를 전부 동시에 요청
+    chain, form_ko, spawn, extra, art = await asyncio.gather(
+        _timed("진화", get_chain(), timings),
+        _timed("폼이름", get_form_names(), timings),
+        _timed("위키", get_pixelmon_spawn_info(species_data['name']), timings),
+        _timed("특성", get_pokemon_extra_info(data, species_data), timings),
+        _timed("일러스트", fetch_bytes(get_image_url(data)) if need_art else asyncio.sleep(0, result=None), timings),
+    )
     view = PokemonView(species_data, data, chain, form_ko)
+
+    if cached_png is not None:
+        CARD_PNG_CACHE.move_to_end(data['name'])
+        _log_timings(data['name'] + " (캐시)", timings, time.perf_counter() - t_start)
+        return {'file': discord.File(BytesIO(cached_png), filename=f"{data['name']}.png")}, view
+
+    info = assemble_info(data, species_data, form_ko, spawn, extra, art)
+    png = await _timed("렌더", render_png(info), timings)
+    _log_timings(data['name'], timings, time.perf_counter() - t_start)
+    if png is None:
+        return {'embed': make_embed(info)}, view
+
+    # 일러스트나 위키 정보가 빠진 불완전한 카드는 캐시하지 않음
+    if info['art'] is not None and spawn[1] != "정보 없음 (위키 연결 실패)":
+        CARD_PNG_CACHE[data['name']] = png
+        if len(CARD_PNG_CACHE) > 150:
+            CARD_PNG_CACHE.popitem(last=False)
+    payload = {'file': discord.File(BytesIO(png), filename=f"{data['name']}.png")}
     return payload, view
 
 # ==========================================
