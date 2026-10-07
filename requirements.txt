@@ -1,6 +1,5 @@
-discord.py
-requests
-pymongo
-Flask
+discord.py>=2.0
 aiohttp
 beautifulsoup4
+flask
+Pillow
