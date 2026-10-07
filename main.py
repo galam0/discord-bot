@@ -422,6 +422,69 @@ def match_form(suffix):
             return key
     return None
 
+# PokeAPI에 한국어 폼 이름이 없는 경우를 위한 수동 번역 (필요하면 계속 추가)
+FORM_SUFFIX_KO = {
+    'battle-bond': '유대변화',
+    'own-tempo': '마이페이스',
+    'totem': '주인 포켓몬',
+    'zen': '달마 모드',
+    'eternamax': '무한다이맥스',
+    'starter': '파트너',
+    'female': '암컷',
+    'male': '수컷',
+    'midday': '한낮의 모습',
+    'midnight': '한밤중의 모습',
+    'single-strike': '일격의 태세',
+    'rapid-strike': '연격의 태세',
+    'low-key': '로우한 모습',
+    'amped': '하이한 모습',
+    'power-construct': '스웜체인지',
+}
+
+FORM_KO_CACHE = {}
+
+async def get_form_ko_name(pokemon_name):
+    """PokeAPI pokemon-form의 한국어 폼 이름 (없으면 None)"""
+    if pokemon_name in FORM_KO_CACHE:
+        return FORM_KO_CACHE[pokemon_name]
+    data = await fetch_json(f"{POKEAPI}/pokemon-form/{pokemon_name}")
+    if data is None:
+        return None  # 실패는 캐시하지 않음
+    ko = next((n['name'] for n in data.get('form_names', [])
+               if n['language']['name'] == 'ko' and n.get('name')), None)
+    FORM_KO_CACHE[pokemon_name] = ko
+    return ko
+
+def match_suffix_ko(suffix):
+    if not suffix:
+        return None
+    if suffix in FORM_SUFFIX_KO:
+        return FORM_SUFFIX_KO[suffix]
+    for key in sorted(FORM_SUFFIX_KO, key=len, reverse=True):
+        if suffix.startswith(key + '-') or suffix.endswith('-' + key):
+            return FORM_SUFFIX_KO[key]
+    return None
+
+def resolve_form_label(pokemon_name, species_name, form_ko):
+    """
+    폼 이름 결정 우선순위:
+    1) FORM_TRANSLATIONS  2) PokeAPI 한국어 폼 이름  3) FORM_SUFFIX_KO  4) 영어 그대로
+    반환: (label, emoji, style, key, source)
+    """
+    suffix = get_form_suffix(pokemon_name, species_name)
+    key = match_form(suffix)
+    if key:
+        label, emoji, style = FORM_TRANSLATIONS[key]
+        return label, emoji, style, key, 'dict'
+    api_ko = form_ko.get(pokemon_name)
+    if api_ko:
+        return api_ko, "🔄", discord.ButtonStyle.secondary, None, 'api'
+    fb = match_suffix_ko(suffix)
+    if fb:
+        return fb, "🔄", discord.ButtonStyle.secondary, None, 'fallback'
+    eng = f"{(suffix or pokemon_name).replace('-', ' ').title()} 폼"
+    return eng, "🔄", discord.ButtonStyle.secondary, None, 'english'
+
 def get_default_variety(species_data):
     for v in species_data.get('varieties', []):
         if v.get('is_default'):
@@ -442,7 +505,7 @@ def find_evolutions(node, target, parent=None):
 # ==========================================
 # 8. Embed 생성기
 # ==========================================
-async def build_embed(data, species_data):
+async def build_embed(data, species_data, form_ko):
     display_name = ko_name(species_data['name'])
     for entry in species_data.get('names', []):
         if entry['language']['name'] == 'ko':
@@ -450,16 +513,13 @@ async def build_embed(data, species_data):
             break
 
     if not data.get('is_default', True):
-        suffix = get_form_suffix(data['name'], species_data['name'])
-        key = match_form(suffix)
-        if key:
-            k_name = FORM_TRANSLATIONS[key][0]
-            if key in PREFIX_FORMS:
-                display_name = f"{k_name.replace(' 폼', '').replace('진화', '')} {display_name}"
-            else:
-                display_name = f"{display_name} ({k_name})"
-        elif suffix:
-            display_name = f"{display_name} ({suffix.replace('-', ' ').title()} 폼)"
+        label, _, _, key, source = resolve_form_label(data['name'], species_data['name'], form_ko)
+        if key and key in PREFIX_FORMS:
+            display_name = f"{label.replace(' 폼', '').replace('진화', '')} {display_name}"
+        elif source == 'api' and display_name in label:
+            display_name = label  # 예: '지우개굴닌자'처럼 이름 전체가 들어있는 경우
+        else:
+            display_name = f"{display_name} ({label})"
 
     sprites = data.get('sprites', {})
     image_url = (sprites.get('other', {}).get('official-artwork', {}).get('front_default')
@@ -469,15 +529,16 @@ async def build_embed(data, species_data):
 
     stats = {s['stat']['name']: s['base_stat'] for s in data['stats']}
     total = sum(stats.values())
-    border = "+" + "-" * 38 + "+"
-    stats_table = (
-        f"```text\n{border}\n"
-        "|  HP  Atk  Def  SpA  SpD  Spe | Total |\n"
-        f"{border}\n"
-        f"| {stats.get('hp',0):>3}  {stats.get('attack',0):>3}  {stats.get('defense',0):>3}  "
-        f"{stats.get('special-attack',0):>3}  {stats.get('special-defense',0):>3}  {stats.get('speed',0):>3} |  {total:>3}  |\n"
-        f"{border}```"
-    )
+    # 세로형 + 막대 그래프 (폭 20자 이내 → 모바일에서도 안 꺾임)
+    stat_rows = [('hp', 'HP '), ('attack', 'Atk'), ('defense', 'Def'),
+                 ('special-attack', 'SpA'), ('special-defense', 'SpD'), ('speed', 'Spe')]
+    lines = []
+    for key, label in stat_rows:
+        v = stats.get(key, 0)
+        bar = '█' * max(1, round(v / 255 * 12))
+        lines.append(f"{label} {v:>3} {bar}")
+    lines.append(f"Tot {total:>3}")
+    stats_table = "```text\n" + "\n".join(lines) + "\n```"
 
     (biome_info, time_info), (ability_text, hidden_text, egg_group_text, hatch_text, catch_text) = await asyncio.gather(
         get_pixelmon_spawn_info(species_data['name']),
@@ -521,8 +582,16 @@ async def build_pokemon_message(query):
         chain_json = await fetch_json(url)
         return chain_json['chain'] if chain_json else None
 
-    embed, chain = await asyncio.gather(build_embed(data, species_data), get_chain())
-    view = PokemonView(species_data, data, chain)
+    async def get_form_names():
+        names = {v['pokemon']['name'] for v in species_data.get('varieties', [])}
+        names.add(data['name'])
+        names = [n for n in names if get_form_suffix(n, species_data['name'])]
+        results = await asyncio.gather(*(get_form_ko_name(n) for n in names))
+        return {n: ko for n, ko in zip(names, results) if ko}
+
+    chain, form_ko = await asyncio.gather(get_chain(), get_form_names())
+    embed = await build_embed(data, species_data, form_ko)
+    view = PokemonView(species_data, data, chain, form_ko)
     return embed, view
 
 # ==========================================
@@ -531,7 +600,7 @@ async def build_pokemon_message(query):
 class PokemonView(discord.ui.View):
     MAX_BUTTONS = 25
 
-    def __init__(self, species_data, pokemon_data, chain):
+    def __init__(self, species_data, pokemon_data, chain, form_ko=None):
         super().__init__(timeout=180)
         self.message = None
         self._targets = set()
@@ -559,13 +628,7 @@ class PokemonView(discord.ui.View):
             name = var['pokemon']['name']
             if name in (current, default_name):
                 continue
-            suffix = get_form_suffix(name, species_data['name'])
-            key = match_form(suffix)
-            if key:
-                label, emoji, style = FORM_TRANSLATIONS[key]
-            else:
-                label = f"{(suffix or name).replace('-', ' ').title()} 폼"
-                emoji, style = "🔄", discord.ButtonStyle.secondary
+            label, emoji, style, _, _ = resolve_form_label(name, species_data['name'], form_ko or {})
             self._add(name, f"{emoji} {label}", style)
 
     def _add(self, target, label, style):
