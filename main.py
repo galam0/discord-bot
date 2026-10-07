@@ -1,3 +1,7 @@
+import sys
+# Render 같은 호스팅에서 print가 바로 로그에 보이도록 (출력 버퍼링 끄기)
+sys.stdout.reconfigure(line_buffering=True)
+
 import discord
 import os
 import re
@@ -149,9 +153,48 @@ async def fetch_species_name(url):
             break
     return True
 
+GRAPHQL_URL = "https://graphql.pokeapi.co/v1beta2"
+KO_NAMES_QUERY = """
+query koNames {
+  pokemonspeciesname(where: {language: {name: {_eq: "ko"}}}) {
+    name
+    pokemon_species_id
+    pokemonspecy { name }
+  }
+}"""
+
+async def build_korean_cache_graphql():
+    """GraphQL로 한국어 이름 전체를 요청 1번에 받기. 실패하면 False"""
+    try:
+        async with HTTP_SEM:
+            async with HTTP_SESSION.post(GRAPHQL_URL, json={"query": KO_NAMES_QUERY}) as r:
+                if r.status != 200:
+                    return False
+                body = await r.json()
+        rows = body.get("data", {}).get("pokemonspeciesname") or []
+        if len(rows) < 900:  # 이상하게 적으면 믿지 않고 기존 방식으로
+            return False
+        for row in rows:
+            ko, sid = row.get("name"), row.get("pokemon_species_id")
+            en = (row.get("pokemonspecy") or {}).get("name")
+            if not ko or not sid:
+                continue
+            POKEMON_KO_TO_ID[ko.replace(' ', '').lower()] = str(sid)
+            if en:
+                SPECIES_EN_TO_KO[en] = ko
+        return True
+    except Exception as e:
+        print(f"[GraphQL] 실패, 기존 방식으로 전환: {e}")
+        return False
+
 async def build_korean_cache():
     global KOREAN_CACHE_READY
     print('🔄 포켓몬 한국어 데이터베이스 수집 중...')
+    t = time.perf_counter()
+    if await build_korean_cache_graphql():
+        KOREAN_CACHE_READY = True
+        print(f"✅ 데이터베이스 수집 완료! ({len(POKEMON_KO_TO_ID)}종, GraphQL {time.perf_counter() - t:.1f}초)")
+        return
     listing = await fetch_json(f'{POKEAPI}/pokemon-species?limit=10000', use_cache=False)
     if not listing:
         print('❌ 종 목록을 불러오지 못했습니다.')
@@ -779,9 +822,38 @@ def _stat_color(v):
     if v < 120: return "#7ed37a"
     return "#4fc3f7"
 
+CARD_SCALE = 2          # 2배로 그린 뒤 축소 (테두리가 매끈해짐). 서버가 아주 느리면 1로
+TOP_BG_H = 460          # 그라데이션 + 빛 효과가 들어가는 상단 영역 높이
+_TOP_BG_CACHE = {}
+_GLOW_MASK = None
+
+def _top_background(c1, c2):
+    """타입 색 조합별 상단 배경(그라데이션 + 일러스트 뒤 빛)을 한 번만 만들고 재사용"""
+    global _GLOW_MASK
+    key = (c1, c2)
+    if key in _TOP_BG_CACHE:
+        return _TOP_BG_CACHE[key]
+    S, W = CARD_SCALE, 1000
+    th, bh = TOP_BG_H * S, 230 * S
+    top = Image.new("RGB", (W * S, th), CARD_BG)
+    band = Image.composite(Image.new("RGB", (W * S, bh), c2), Image.new("RGB", (W * S, bh), c1),
+                           Image.linear_gradient("L").rotate(90).resize((W * S, bh)))
+    top.paste(Image.composite(Image.new("RGB", (W * S, bh), CARD_BG), band,
+                              Image.linear_gradient("L").resize((W * S, bh))), (0, 0))
+    if _GLOW_MASK is None:
+        # 흐림 효과는 비싸서 딱 한 번만 계산 (색과 무관한 모양만 저장)
+        g = Image.new("L", (W * S, th), 0)
+        ImageDraw.Draw(g).ellipse([70 * S, 70 * S, 370 * S, 370 * S], fill=90)
+        _GLOW_MASK = g.filter(ImageFilter.GaussianBlur(45 * S))
+    top.paste(Image.new("RGB", top.size, c1), (0, 0), _GLOW_MASK)
+    _TOP_BG_CACHE[key] = top
+    if len(_TOP_BG_CACHE) > 200:
+        _TOP_BG_CACHE.pop(next(iter(_TOP_BG_CACHE)))
+    return top
+
 def render_card(info):
     """정보 dict → PNG BytesIO (CPU 작업이라 to_thread로 호출)"""
-    S, W = 2, 1000
+    S, W = CARD_SCALE, 1000
     MAX_BIOME_LINES = 6
     def p(*v): return [round(x * S) for x in v]
 
@@ -802,20 +874,10 @@ def render_card(info):
 
     img = Image.new("RGB", (W * S, H * S), CARD_BG)
 
-    # 상단 타입색 그라데이션
+    # 상단 배경 (타입색 그라데이션 + 빛) — 캐시된 것을 붙여넣기만 함
     c1 = TYPE_INFO.get(info['types'][0], ('', '#6d7fa8'))[1]
     c2 = TYPE_INFO.get(info['types'][-1], ('', '#6d7fa8'))[1]
-    bh = 230 * S
-    band = Image.composite(Image.new("RGB", (W * S, bh), c2), Image.new("RGB", (W * S, bh), c1),
-                           Image.linear_gradient("L").rotate(90).resize((W * S, bh)))
-    img.paste(Image.composite(Image.new("RGB", (W * S, bh), CARD_BG), band,
-                              Image.linear_gradient("L").resize((W * S, bh))), (0, 0))
-
-    # 일러스트 뒤 은은한 빛
-    glow = Image.new("L", img.size, 0)
-    ImageDraw.Draw(glow).ellipse(p(70, 70, 370, 370), fill=90)
-    glow = glow.filter(ImageFilter.GaussianBlur(45 * S))
-    img.paste(Image.new("RGB", img.size, c1), (0, 0), glow)
+    img.paste(_top_background(c1, c2), (0, 0))
 
     # 공식 일러스트
     d = ImageDraw.Draw(img)
@@ -823,7 +885,7 @@ def render_card(info):
     if info.get('art'):
         try:
             art = Image.open(BytesIO(info['art'])).convert("RGBA")
-            art.thumbnail((320 * S, 320 * S), Image.LANCZOS)
+            art.thumbnail((320 * S, 320 * S), Image.BILINEAR)
             ax = 220 * S - art.width // 2
             ay = 220 * S - art.height // 2
             img.paste(art, (ax, ay), art)
@@ -906,7 +968,8 @@ def render_card(info):
         d.rounded_rectangle(p(bar_x, yy + 4, bar_x + fw, yy + 18), radius=7 * S, fill=_stat_color(v))
 
     out = BytesIO()
-    img.resize((W, H), Image.LANCZOS).save(out, format="PNG", compress_level=1)  # optimize=True는 0.3초 걸려서 끔
+    final = img.reduce(S) if S > 1 else img  # 정확히 S배 축소는 reduce가 resize보다 훨씬 빠름
+    final.save(out, format="PNG", compress_level=1)  # optimize=True는 0.3초 걸려서 끔
     out.seek(0)
     return out
 
