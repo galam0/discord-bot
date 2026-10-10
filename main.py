@@ -609,6 +609,161 @@ def format_items(display_name, items):
     parts.append(_item_block(items['held'], False) if items['held'] else "> 정보 없음")
     return "\n".join(parts)[:2000]
 
+# ---------- 아이템 → 떨구는 포켓몬 (역검색) ----------
+DROP_INDEX = {}            # 영어 아이템 이름 → [(포켓몬(위키 표기), 확률, 수량), ...]
+DROP_SEARCH_KEYS = {}      # 검색용 키(영어/한글, 공백 제거) → 영어 아이템 이름
+DROP_INDEX_TIME = 0.0
+DROP_KO_READY = False      # 한글 이름 연결이 끝났는지
+DROP_INDEX_TTL = 12 * 3600  # 12시간마다 위키에서 새로 받음
+_DROP_INDEX_LOCK = None
+
+REGION_PREFIX_KO = {'alolan': '알로라', 'galarian': '가라르', 'hisuian': '히스이', 'paldean': '팔데아'}
+
+def _compact(text):
+    """검색/비교용: 악센트 제거, 소문자, 글자·숫자만 남김 ('Poké Ball' → 'pokeball')"""
+    text = unicodedata.normalize("NFKD", text)
+    text = "".join(ch for ch in text if not unicodedata.combining(ch))
+    text = unicodedata.normalize("NFC", text)  # NFKD가 쪼갠 한글 자모를 다시 음절로 합침
+    return re.sub(r"[^0-9a-z가-힣]", "", text.lower())
+
+def parse_drops_page(html):
+    """위키 Drops 페이지 → {아이템: [(포켓몬, 확률, 수량)]} (CPU 작업이라 스레드에서 실행)"""
+    soup = BeautifulSoup(html, "html.parser")
+    index = {}
+    for table in soup.find_all("table"):
+        header = None
+        current_item = None
+        for row in table.find_all("tr"):
+            cells = row.find_all(["th", "td"], recursive=False)
+            texts = [re.sub(r"\s+", " ", c.get_text(" ", strip=True)) for c in cells]
+            lowered = [t.lower() for t in texts]
+            if header is None:
+                if "drop" in lowered and any(t.startswith("pok") for t in lowered):
+                    header = len(cells)
+                continue
+            if len(cells) == header:          # 아이템 칸이 있는 줄
+                current_item = texts[0] or current_item
+                rest = texts[1:]
+            elif len(cells) == header - 1:    # 위 아이템에 이어지는 줄 (아이템 칸이 합쳐져 있음)
+                rest = texts
+            else:
+                continue
+            if not current_item or len(rest) < 2 or not rest[0]:
+                continue
+            qty = rest[2] if len(rest) > 2 else ""
+            index.setdefault(current_item, []).append((rest[0], rest[1], qty))
+    return index
+
+async def ensure_drop_index(force=False):
+    """Drops 페이지를 받아서 아이템별 색인을 만듦. 12시간 동안 재사용."""
+    global DROP_INDEX, DROP_SEARCH_KEYS, DROP_INDEX_TIME, _DROP_INDEX_LOCK
+    if _DROP_INDEX_LOCK is None:
+        _DROP_INDEX_LOCK = asyncio.Lock()
+    async with _DROP_INDEX_LOCK:
+        if DROP_INDEX and not force and time.time() - DROP_INDEX_TIME < DROP_INDEX_TTL:
+            return True
+        t = time.perf_counter()
+        status, html = await fetch_text(f"{WIKI_BASE}/wiki/Drops")
+        if status != 200:
+            print(f"[드랍 색인] 위키 Drops 페이지를 받지 못했어요 (응답 {status})")
+            return bool(DROP_INDEX)  # 예전 색인이 있으면 그거라도 사용
+        index = await asyncio.to_thread(parse_drops_page, html)
+        if not index:
+            print("[드랍 색인] 표를 찾지 못했어요. 위키 구조가 바뀌었을 수 있어요.")
+            return bool(DROP_INDEX)
+
+        # 영어 이름으로 먼저 검색 가능하게 해두고, 한글 이름은 아래에서 채움
+        keys = {_compact(item): item for item in index}
+        DROP_INDEX, DROP_SEARCH_KEYS, DROP_INDEX_TIME = index, keys, time.time()
+        print(f"[드랍 색인] 아이템 {len(index)}종 정리 완료 ({time.perf_counter() - t:.1f}초)")
+
+    # 한글 이름 붙이기 (PokeAPI 요청이 많아서 색인 공개 뒤 천천히 채움)
+    global DROP_KO_READY
+    items = list(index)
+    names = await asyncio.gather(*(translate_item(n) for n in items))
+    for en, ko in zip(items, names):
+        ITEM_KO_CACHE.setdefault(en.strip().lower(), ko)  # 번역 없는 아이템도 기억 (매번 다시 묻지 않게)
+        if ko and ko != en:
+            DROP_SEARCH_KEYS[_compact(ko)] = en
+    DROP_KO_READY = True
+    print(f"[드랍 색인] 한글 이름 {sum(1 for e, k in zip(items, names) if k != e)}종 연결 완료")
+    return True
+
+def pokemon_name_ko(wiki_name):
+    """위키 표기 포켓몬 이름 → 한글 ('Alolan Raichu' → '알로라 라이츄', 'Oricorio (Sensu Style)' → '춤추새 (Sensu Style)')"""
+    name, suffix = wiki_name, ""
+    m = re.match(r"^(.*?)\s*(\(.*\))\s*$", name)
+    if m:
+        name, suffix = m.group(1), " " + m.group(2)
+    prefix = ""
+    first, _, rest = name.partition(" ")
+    if first.lower() in REGION_PREFIX_KO and rest:
+        prefix, name = REGION_PREFIX_KO[first.lower()] + " ", rest
+    key = _compact(name)
+    for en, ko in SPECIES_EN_TO_KO.items():
+        if _compact(en) == key:
+            return f"{prefix}{ko}{suffix}"
+    return wiki_name
+
+def find_drop_items(query):
+    """검색어 → (정확히 찾은 아이템 or None, 후보 목록)"""
+    q = _compact(query)
+    if not q:
+        return None, []
+    if q in DROP_SEARCH_KEYS:
+        return DROP_SEARCH_KEYS[q], []
+    candidates = []
+    for key, en in DROP_SEARCH_KEYS.items():
+        if q in key and en not in candidates:
+            candidates.append(en)
+    if len(candidates) == 1:
+        return candidates[0], []
+    return None, sorted(candidates)
+
+def _chance_value(chance):
+    m = re.search(r"[\d.]+", chance or "")
+    return float(m.group()) if m else 0.0
+
+async def format_drop_search(query):
+    ready = await ensure_drop_index()
+    if not ready:
+        return "⚠️ 픽셀몬 위키에서 드랍 목록을 받아오지 못했어요. 잠시 후 다시 시도해 주세요."
+
+    item, candidates = find_drop_items(query)
+    if not item:
+        if not candidates and re.search(r"[가-힣]", query) and not DROP_KO_READY:
+            return "⏳ 아이템 한글 이름을 준비 중이에요. 잠시 후 다시 시도하거나 영어 이름으로 검색해 주세요."
+        if not candidates:
+            return f"🔍 **{query}** 을(를) 떨구는 포켓몬을 찾지 못했어요. 아이템 이름을 다시 확인해 주세요."
+        shown = []
+        for en in candidates[:15]:
+            ko = await translate_item(en)
+            shown.append(f"`{ko}`" + (f" ({en})" if ko != en else ""))
+        more = f" 외 {len(candidates) - 15}개" if len(candidates) > 15 else ""
+        return f"🔍 **{query}** 와 비슷한 아이템이 여러 개 있어요. 정확한 이름으로 다시 검색해 주세요.\n" + \
+               ", ".join(shown) + more
+
+    item_ko = await translate_item(item)
+    rows = sorted(DROP_INDEX[item], key=lambda r: -_chance_value(r[1]))
+    named = [(pokemon_name_ko(p), c, q) for p, c, q in rows]
+    name_w = max(_disp_width(n) for n, _, _ in named)
+
+    lines = []
+    for name, chance, qty in named:
+        line = f"{_pad(name, name_w)}  {chance:>5}"
+        if qty and qty not in ("—", "-"):
+            line += f"  {qty}개"
+        lines.append(line)
+
+    title = f"🎒 **{item_ko}**" + (f" ({item})" if item_ko != item else "") + f" — 떨구는 포켓몬 {len(rows)}마리"
+    body = "\n".join(lines)
+    limit = 2000 - len(title) - 40
+    if len(body) > limit:
+        cut = body[:limit].rsplit("\n", 1)[0]
+        hidden = len(lines) - cut.count("\n") - 1
+        body = cut + f"\n… 외 {hidden}마리"
+    return f"{title}\n```text\n{body}\n```"
+
 # ==========================================
 # 7. 포켓몬 조회 / 폼 처리
 # ==========================================
@@ -858,7 +1013,9 @@ def _stat_color(v):
     return "#4fc3f7"
 
 CARD_SCALE = 1          # 1: 빠름 (Render 무료 서버용) / 2: 2배로 그린 뒤 축소해서 테두리가 더 매끈하지만 느림
-TOP_BG_H = 460          # 그라데이션 + 빛 효과가 들어가는 상단 영역 높이
+CARD_W = 800            # 디스코드 미리보기(약 520px)에서 덜 줄어들도록 폭을 줄이고 글자를 키움
+TOP_BG_H = 430          # 그라데이션 + 빛 효과가 들어가는 상단 영역 높이
+LABEL_COLOR = "#a8b1cc"
 _TOP_BG_CACHE = {}
 _GLOW_MASK = None
 
@@ -868,8 +1025,8 @@ def _top_background(c1, c2):
     key = (c1, c2)
     if key in _TOP_BG_CACHE:
         return _TOP_BG_CACHE[key]
-    S, W = CARD_SCALE, 1000
-    th, bh = TOP_BG_H * S, 230 * S
+    S, W = CARD_SCALE, CARD_W
+    th, bh = TOP_BG_H * S, 200 * S
     top = Image.new("RGB", (W * S, th), CARD_BG)
     band = Image.composite(Image.new("RGB", (W * S, bh), c2), Image.new("RGB", (W * S, bh), c1),
                            Image.linear_gradient("L").rotate(90).resize((W * S, bh)))
@@ -878,8 +1035,8 @@ def _top_background(c1, c2):
     if _GLOW_MASK is None:
         # 흐림 효과는 비싸서 딱 한 번만 계산 (색과 무관한 모양만 저장)
         g = Image.new("L", (W * S, th), 0)
-        ImageDraw.Draw(g).ellipse([70 * S, 70 * S, 370 * S, 370 * S], fill=90)
-        _GLOW_MASK = g.filter(ImageFilter.GaussianBlur(45 * S))
+        ImageDraw.Draw(g).ellipse([35 * S, 45 * S, 295 * S, 305 * S], fill=90)
+        _GLOW_MASK = g.filter(ImageFilter.GaussianBlur(40 * S))
     top.paste(Image.new("RGB", top.size, c1), (0, 0), _GLOW_MASK)
     _TOP_BG_CACHE[key] = top
     if len(_TOP_BG_CACHE) > 200:
@@ -887,25 +1044,26 @@ def _top_background(c1, c2):
     return top
 
 def render_card(info):
-    """정보 dict → PNG BytesIO (CPU 작업이라 to_thread로 호출)"""
-    S, W = CARD_SCALE, 1000
+    """정보 dict → JPEG BytesIO (CPU 작업이라 to_thread로 호출)"""
+    S, W = CARD_SCALE, CARD_W
     MAX_BIOME_LINES = 6
+    R = W - 30  # 오른쪽 여백 기준선
     def p(*v): return [round(x * S) for x in v]
 
     measure = ImageDraw.Draw(Image.new("RGB", (10, 10)))
-    biome_font = card_font('bold', 19 * S)
+    biome_font = card_font('bold', 22 * S)
     if info['biomes']:
-        lines = _wrap_items(measure, info['biomes'], biome_font, 888 * S)
+        lines = _wrap_items(measure, info['biomes'], biome_font, (R - 30 - 32) * S)
         if len(lines) > MAX_BIOME_LINES:
             lines = lines[:MAX_BIOME_LINES]
             lines[-1] = lines[-1].rstrip(",") + " …"
     else:
         lines = [info['biome_empty'] or "정보 없음"]
-    line_h = 28
-    by = 425
-    biome_h = 34 + line_h * len(lines)
-    sy = by + biome_h + 22
-    H = sy + 40 + 3 * 36 + 24
+    line_h = 31
+    by = 440
+    biome_h = 44 + line_h * len(lines)
+    sy = by + biome_h + 26
+    H = sy + 44 + 3 * 42 + 20
 
     img = Image.new("RGB", (W * S, H * S), CARD_BG)
 
@@ -915,97 +1073,101 @@ def render_card(info):
     img.paste(_top_background(c1, c2), (0, 0))
 
     # 공식 일러스트
-    d = ImageDraw.Draw(img)
     art_ok = False
     if info.get('art'):
         try:
             art = Image.open(BytesIO(info['art'])).convert("RGBA")
-            art.thumbnail((250 * S, 250 * S), Image.BILINEAR)  # 공식 일러스트(475px)가 이전과 비슷한 크기로
-            ax = 220 * S - art.width // 2
-            ay = 220 * S - art.height // 2
-            img.paste(art, (ax, ay), art)
+            art.thumbnail((245 * S, 245 * S), Image.BILINEAR)
+            img.paste(art, (165 * S - art.width // 2, 178 * S - art.height // 2), art)
             art_ok = True
         except Exception:
             pass
     d = ImageDraw.Draw(img)
     if not art_ok:
-        d.rounded_rectangle(p(70, 70, 370, 370), radius=28 * S, outline="#6d7fa8", width=2 * S)
-        d.text(p(220, 220), "이미지 없음", font=card_font('regular', 22 * S), fill="#b9c4e6", anchor="mm")
+        d.rounded_rectangle(p(45, 58, 285, 298), radius=24 * S, outline="#6d7fa8", width=2 * S)
+        d.text(p(165, 178), "이미지 없음", font=card_font('regular', 22 * S), fill="#b9c4e6", anchor="mm")
 
     # 번호 / 등급 / 이름 / 타입
-    x0 = 420
+    x0 = 318
+    no_font = card_font('bold', 24 * S)
     no_text = f"No.{info['no']:04d}"
-    d.text(p(x0, 52), no_text, font=card_font('bold', 22 * S), fill="#dfe6ff")
+    d.text(p(x0, 30), no_text, font=no_font, fill="#dfe6ff")
     if info['rarity']:
         label, color = ("전설", "#d4a017") if info['rarity'] == 'legendary' else ("환상", "#9b59b6")
-        nx = x0 + measure.textlength(no_text, font=card_font('bold', 22 * S)) / S + 14
-        lw = measure.textlength(label, font=card_font('bold', 17 * S)) / S
-        d.rounded_rectangle(p(nx, 52, nx + lw + 24, 80), radius=14 * S, fill=color)
-        d.text(p(nx + 12, 66), label, font=card_font('bold', 17 * S), fill="#ffffff", anchor="lm")
+        badge_font = card_font('bold', 19 * S)
+        nx = x0 + measure.textlength(no_text, font=no_font) / S + 14
+        lw = measure.textlength(label, font=badge_font) / S
+        d.rounded_rectangle(p(nx, 30, nx + lw + 26, 60), radius=15 * S, fill=color)
+        d.text(p(nx + 13, 45), label, font=badge_font, fill="#ffffff", anchor="lm")
 
-    name_text, name_font = _fit(measure, info['name'], 'heavy', 56 * S, 540 * S, min_size=28 * S)
-    d.text(p(x0, 88), name_text, font=name_font, fill="#ffffff")
+    name_text, name_font = _fit(measure, info['name'], 'heavy', 60 * S, (R - x0) * S, min_size=32 * S)
+    d.text(p(x0, 62), name_text, font=name_font, fill="#ffffff")
 
     tx = x0
-    type_font = card_font('bold', 22 * S)
+    type_font = card_font('bold', 24 * S)
     for t in info['types']:
         t_ko, t_color = TYPE_INFO.get(t, (t.title(), '#6d7fa8'))
         tw = measure.textlength(t_ko, font=type_font) / S
-        d.rounded_rectangle(p(tx, 162, tx + tw + 36, 198), radius=18 * S, fill=t_color)
-        d.text(p(tx + 18, 180), t_ko, font=type_font, fill=_text_color_on(t_color), anchor="lm")
+        d.rounded_rectangle(p(tx, 140, tx + tw + 36, 178), radius=19 * S, fill=t_color)
+        d.text(p(tx + 18, 159), t_ko, font=type_font, fill=_text_color_on(t_color), anchor="lm")
         tx += tw + 48
 
     # 정보 칸 (2열 x 3행)
     cells = [("특성", info['ability']), ("숨겨진 특성", info['hidden']),
              ("알 그룹", info['egg']), ("포획률", info['catch']),
              ("부화 걸음 수", info['hatch']), ("출몰 시간", info['time'])]
+    cell_w = (R - x0 - 12) // 2
     for i, (k, v) in enumerate(cells):
-        cx = x0 + (i % 2) * 280
-        cy = 225 + (i // 2) * 64
-        d.rounded_rectangle(p(cx, cy, cx + 265, cy + 54), radius=12 * S, fill=PANEL)
-        d.text(p(cx + 16, cy + 9), k, font=card_font('regular', 15 * S), fill="#8d96b3")
+        cx = x0 + (i % 2) * (cell_w + 12)
+        cy = 194 + (i // 2) * 80
+        d.rounded_rectangle(p(cx, cy, cx + cell_w, cy + 72), radius=12 * S, fill=PANEL)
+        d.text(p(cx + 14, cy + 8), k, font=card_font('regular', 19 * S), fill=LABEL_COLOR)
         v = str(v)
-        max_w = 235 * S
-        if measure.textlength(v, font=card_font('bold', 16 * S)) <= max_w:
-            # 한 줄로 충분하면 19 → 16 사이에서 최대 크기로
-            v_text, v_font = _fit(measure, v, 'bold', 19 * S, max_w, min_size=16 * S)
-            d.text(p(cx + 16, cy + 28), v_text, font=v_font, fill="#ffffff")
+        max_w = (cell_w - 28) * S
+        if measure.textlength(v, font=card_font('bold', 20 * S)) <= max_w:
+            # 한 줄로 충분하면 25 → 20 사이에서 최대 크기로
+            v_text, v_font = _fit(measure, v, 'bold', 25 * S, max_w, min_size=20 * S)
+            d.text(p(cx + 14, cy + 33), v_text, font=v_font, fill="#ffffff")
         else:
             # 길면 쉼표 기준 두 줄로 (그래도 넘치면 … 처리)
-            small = card_font('bold', 14 * S)
+            small = card_font('bold', 18 * S)
             two = _wrap_items(measure, [x.strip() for x in v.split(',')], small, max_w)
             if len(two) > 2:
-                two = [two[0], _fit(measure, " ".join(two[1:]), 'bold', 14 * S, max_w, 14 * S)[0]]
+                two = [two[0], _fit(measure, " ".join(two[1:]), 'bold', 18 * S, max_w, 18 * S)[0]]
             for j, ln in enumerate(two):
-                d.text(p(cx + 16, cy + 25 + j * 15), ln, font=small, fill="#ffffff")
+                d.text(p(cx + 14, cy + 31 + j * 20), ln, font=small, fill="#ffffff")
 
     # 출몰 바이옴
-    d.rounded_rectangle(p(40, by, 960, by + biome_h), radius=12 * S, fill=PANEL)
+    d.rounded_rectangle(p(30, by, R, by + biome_h), radius=12 * S, fill=PANEL)
     title = f"출몰 바이옴 ({len(info['biomes'])}곳)" if info['biomes'] else "출몰 바이옴"
-    d.text(p(56, by + 9), title, font=card_font('regular', 15 * S), fill="#8d96b3")
+    d.text(p(46, by + 9), title, font=card_font('regular', 19 * S), fill=LABEL_COLOR)
     for i, ln in enumerate(lines):
-        d.text(p(56, by + 30 + i * line_h), ln, font=biome_font, fill="#ffffff")
+        d.text(p(46, by + 36 + i * line_h), ln, font=biome_font, fill="#ffffff")
 
     # 종족치
     stats = info['stats']
     total = sum(stats.values())
-    d.text(p(40, sy), "종족치", font=card_font('bold', 20 * S), fill="#ffffff")
-    d.text(p(960, sy), f"합계 {total}", font=card_font('bold', 20 * S), fill="#ffffff", anchor="ra")
+    head_font = card_font('bold', 24 * S)
+    d.text(p(30, sy), "종족치", font=head_font, fill="#ffffff")
+    d.text(p(R, sy), f"합계 {total}", font=head_font, fill="#ffffff", anchor="ra")
+    stat_font = card_font('bold', 21 * S)
+    col_w = (R - 30) // 2
     for i, (key, label) in enumerate(STAT_ROWS):
         v = stats.get(key, 0)
-        bx = 40 + (i % 2) * 470
-        yy = sy + 40 + (i // 2) * 36
-        d.text(p(bx, yy + 11), label, font=card_font('bold', 17 * S), fill="#c7cde0", anchor="lm")
-        d.text(p(bx + 110, yy + 11), str(v), font=card_font('bold', 17 * S), fill="#ffffff", anchor="rm")
-        bar_x, bar_w = bx + 125, 320
-        d.rounded_rectangle(p(bar_x, yy + 4, bar_x + bar_w, yy + 18), radius=7 * S, fill="#262b3b")
-        fw = min(bar_w, max(14, bar_w * v / 180))
-        d.rounded_rectangle(p(bar_x, yy + 4, bar_x + fw, yy + 18), radius=7 * S, fill=_stat_color(v))
+        bx = 30 + (i % 2) * (col_w + 10)
+        yy = sy + 44 + (i // 2) * 42
+        d.text(p(bx, yy + 12), label, font=stat_font, fill="#c7cde0", anchor="lm")
+        d.text(p(bx + 104, yy + 12), str(v), font=stat_font, fill="#ffffff", anchor="rm")
+        bar_x = bx + 118
+        bar_w = col_w - 118 - 10
+        d.rounded_rectangle(p(bar_x, yy + 3, bar_x + bar_w, yy + 21), radius=9 * S, fill="#262b3b")
+        fw = min(bar_w, max(18, bar_w * v / 180))
+        d.rounded_rectangle(p(bar_x, yy + 3, bar_x + fw, yy + 21), radius=9 * S, fill=_stat_color(v))
 
     out = BytesIO()
     final = img.reduce(S) if S > 1 else img  # 정확히 S배 축소는 reduce가 resize보다 훨씬 빠름
     # JPEG가 PNG보다 저장이 훨씬 빠르고 용량도 작음 (투명 배경이 없어서 화질 차이 거의 없음)
-    final.save(out, format="JPEG", quality=92, subsampling=0)  # optimize=True는 0.3초 걸려서 끔
+    final.save(out, format="JPEG", quality=92, subsampling=0)
     out.seek(0)
     return out
 
@@ -1278,6 +1440,8 @@ class PokemonBot(discord.Client):
         # 카드 렌더 준비 작업도 미리 (별도 스레드라 봇은 멈추지 않음)
         if CARD_ENABLED:
             self._card_warmup = asyncio.create_task(asyncio.to_thread(warmup_card))
+        # 아이템 역검색용 드랍 목록도 미리 받아 둠
+        self._drop_task = asyncio.create_task(ensure_drop_index())
 
     async def close(self):
         if HTTP_SESSION and not HTTP_SESSION.closed:
@@ -1296,7 +1460,21 @@ async def on_message(message):
         return
 
     parts = message.content.split(maxsplit=1)
-    if not parts or parts[0] != '!도감':
+    if not parts or parts[0] not in ('!도감', '!아이템'):
+        return
+
+    if parts[0] == '!아이템':
+        try:
+            if len(parts) < 2:
+                await message.channel.send('사용법: `!아이템 모래` / `!아이템 끈기갈고리손톱` / `!아이템 grip claw`')
+                return
+            async with message.channel.typing():
+                text = await format_drop_search(parts[1].strip())
+            await message.channel.send(text)
+        except discord.HTTPException as e:
+            print(f"[디스코드 에러] 아이템 검색 응답 실패: {e}")
+        except Exception:
+            traceback.print_exc()
         return
 
     try:
