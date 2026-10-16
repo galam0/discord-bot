@@ -561,6 +561,20 @@ def _parse_item_table(soup, heading_names, name_col, has_qty):
         rows.append((texts[col[name_col]], texts[col['chance']], qty))
     return rows
 
+async def _drops_from_index(species_name):
+    """드랍 색인(아이템→포켓몬)을 뒤집어 이 포켓몬의 드랍 목록을 만든다. 색인이 없으면 None. 지닌 물건 정보는 없음."""
+    if not await ensure_drop_index():
+        return None
+    target = _compact(wiki_title(species_name).replace("_", " "))
+    rows = []
+    for item, entries in DROP_INDEX.items():
+        for pokemon, chance, qty in entries:
+            if _compact(pokemon) == target:
+                rows.append((item, chance, qty))
+    rows.sort(key=lambda r: -_chance_value(r[1]))
+    names = await asyncio.gather(*(translate_item(n) for n, _, _ in rows))
+    return {'drops': [(ko, c, q) for ko, (_, c, q) in zip(names, rows)], 'held': []}
+
 async def get_pixelmon_items(species_name):
     """{'drops': [(이름, 확률, 수량)], 'held': [(이름, 확률, '')]} 또는 연결 실패 시 None"""
     if species_name in PIXELMON_ITEMS_CACHE:
@@ -568,6 +582,12 @@ async def get_pixelmon_items(species_name):
     secs = await get_wiki_sections(species_name)
     if secs is None:
         return None
+    if not secs['found']:
+        # 위키가 막혔거나 페이지가 없으면, 드랍 색인(저장 파일 포함)에서 이 포켓몬이 떨구는 아이템을 모아서 보여줌
+        fallback = await _drops_from_index(species_name)
+        if fallback is not None:
+            PIXELMON_ITEMS_CACHE[species_name] = fallback
+            return fallback
     result = {'drops': [], 'held': []}
     if secs['drops']:
         result['drops'] = _parse_item_table(BeautifulSoup(secs['drops'], "html.parser"), {"drops"}, 'drop', True)
@@ -654,6 +674,15 @@ def parse_drops_page(html):
             index.setdefault(current_item, []).append((rest[0], rest[1], qty))
     return index
 
+def _read_saved_drops_page():
+    """봇 폴더의 drops.html (브라우저에서 위키 Drops 페이지를 '다른 이름으로 저장'한 파일). 없으면 빈 문자열."""
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "drops.html")
+    try:
+        with open(path, encoding="utf-8", errors="ignore") as f:
+            return f.read()
+    except OSError:
+        return ""
+
 async def ensure_drop_index(force=False):
     """Drops 페이지를 받아서 아이템별 색인을 만듦. 12시간 동안 재사용."""
     global DROP_INDEX, DROP_SEARCH_KEYS, DROP_INDEX_TIME, _DROP_INDEX_LOCK
@@ -666,7 +695,10 @@ async def ensure_drop_index(force=False):
         status, html = await fetch_text(f"{WIKI_BASE}/wiki/Drops")
         if status != 200:
             print(f"[드랍 색인] 위키 Drops 페이지를 받지 못했어요 (응답 {status})")
-            return bool(DROP_INDEX)  # 예전 색인이 있으면 그거라도 사용
+            html = _read_saved_drops_page()  # 위키가 막히면 직접 저장해 둔 파일(drops.html)을 사용
+            if not html:
+                return bool(DROP_INDEX)  # 예전 색인이 있으면 그거라도 사용
+            print("[드랍 색인] 저장해 둔 drops.html 파일로 대신합니다.")
         index = await asyncio.to_thread(parse_drops_page, html)
         if not index:
             print("[드랍 색인] 표를 찾지 못했어요. 위키 구조가 바뀌었을 수 있어요.")
