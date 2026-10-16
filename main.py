@@ -676,9 +676,13 @@ def parse_drops_page(html):
 
 def _read_saved_drops_page():
     """봇 폴더의 drops.html (브라우저에서 위키 Drops 페이지를 '다른 이름으로 저장'한 파일). 없으면 빈 문자열."""
-    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "drops.html")
+    folder = os.path.dirname(os.path.abspath(__file__))
     try:
-        with open(path, encoding="utf-8", errors="ignore") as f:
+        # 대소문자 구분 없이 찾음 (Drops.html / drops.html 모두 허용)
+        name = next((n for n in os.listdir(folder) if n.lower() == "drops.html"), None)
+        if not name:
+            return ""
+        with open(os.path.join(folder, name), encoding="utf-8", errors="ignore") as f:
             return f.read()
     except OSError:
         return ""
